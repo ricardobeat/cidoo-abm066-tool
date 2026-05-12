@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>CIDOO Clock WebHID</title>
+    <link rel="stylesheet" href="./styles.css">
+    <script type="module" src="./app.mjs"></script>
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <h1>CIDOO Clock</h1>
+          <p id="support" class="muted">Checking WebHID</p>
+        </div>
+        <div class="status">
+          <span id="status">Starting</span>
+          <span id="device-name" class="muted"></span>
+        </div>
+      </header>
+
+      <section class="workspace">
+        <form id="controls" class="panel controls" autocomplete="off">
+          <fieldset>
+            <legend>HID Target</legend>
+            <label>
+              VID
+              <input id="vid" spellcheck="false">
+            </label>
+            <label>
+              PID
+              <input id="pid" spellcheck="false">
+            </label>
+            <label>
+              Usage Page
+              <input id="usage-page" spellcheck="false">
+            </label>
+            <label>
+              Usage
+              <input id="usage" spellcheck="false">
+            </label>
+            <label>
+              Report ID
+              <input id="report-id" spellcheck="false">
+            </label>
+            <label>
+              Slot
+              <input id="slot" type="number" min="0" max="1024" step="1">
+            </label>
+            <label>
+              Timeout ms
+              <input id="timeout-ms" type="number" min="100" max="30000" step="100">
+            </label>
+          </fieldset>
+
+          <fieldset>
+            <legend>Device</legend>
+            <div class="button-row">
+              <button id="connect" type="button">Connect</button>
+              <button id="disconnect" type="button" class="secondary">Disconnect</button>
+            </div>
+            <div class="button-row">
+              <button id="read-template" type="button" class="secondary">Read Record</button>
+            </div>
+          </fieldset>
+
+          <fieldset>
+            <legend>Clock</legend>
+            <label class="choice">
+              <input id="time-now" type="radio" name="time-mode" checked>
+              Host time
+            </label>
+            <label class="choice">
+              <input id="time-custom" type="radio" name="time-mode">
+              Custom time
+            </label>
+            <input id="custom-time" type="datetime-local" step="1">
+            <dl class="facts">
+              <div>
+                <dt>Pending bytes</dt>
+                <dd id="pending-time"></dd>
+              </div>
+            </dl>
+            <label class="choice confirm">
+              <input id="write-confirm" type="checkbox">
+              Patch only bytes 35..41
+            </label>
+            <button id="update-clock" type="button">Update Clock</button>
+          </fieldset>
+        </form>
+
+        <section class="panel readout">
+          <div class="split">
+            <div>
+              <h2>Record</h2>
+              <dl class="facts">
+                <div>
+                  <dt>SHA-256</dt>
+                  <dd id="template-hash"></dd>
+                </div>
+                <div>
+                  <dt>Stable SHA-256</dt>
+                  <dd id="stable-hash"></dd>
+                </div>
+                <div>
+                  <dt>Decoded Time</dt>
+                  <dd id="decoded-time"></dd>
+                </div>
+              </dl>
+              <pre id="record-hex" class="codeblock"></pre>
+            </div>
+            <div>
+              <h2>Changed Offsets</h2>
+              <pre id="diff" class="codeblock compact"></pre>
+            </div>
+          </div>
+          <div class="log-head">
+            <h2>Log</h2>
+            <button id="clear-log" type="button" class="secondary small">Clear</button>
+          </div>
+          <pre id="log" class="codeblock log"></pre>
+        </section>
+      </section>
+    </main>
+  </body>
+</html>

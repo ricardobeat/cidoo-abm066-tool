@@ -1,0 +1,21 @@
+CIDOO ABM066 known-good restored template backup
+
+Binary template:
+  cidoo-template-known-good-restored-latest.bin
+
+Full template SHA-256:
+  b7f6a3ddbdf5412fe750612e445913a0a1ecfef875e9cbcbe82a8d6de3201e14
+
+Stable template SHA-256, with clock bytes 35..41 masked:
+  7feb12ff4d6aafc9e0d95fec4c2d4ab366275cfdbdee397545a84230d580cbff
+
+Raw template bytes:
+  00 04 05 01 00 00 c8 00 ff 23 00 00 00 00 00 00
+  00 00 00 00 ff 00 00 00 00 00 00 ff 03 00 00 00
+  0f 00 14 58 34 19 02 12 05 26 00 64 00 00 08 0f
+
+Restore notes:
+  Use the full template SHA-256 above as --expected-template-sha256.
+  Before restoring, read the current device template and use that current
+  "template stable sha256" as --expected-stable-sha256.
+
