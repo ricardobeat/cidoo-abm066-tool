@@ -1,5 +1,10 @@
 module cidoo_clock_c3;
 
+import std::core::mem;
+import std::io;
+import std::time;
+import std::time::clock;
+
 const int K_IOHID_OPTIONS_TYPE_NONE = 0;
 const int K_IOHID_REPORT_TYPE_OUTPUT = 1;
 const int K_IOHID_REPORT_TYPE_FEATURE = 2;
@@ -61,19 +66,19 @@ fn int transport_list_devices(Options* opt, bool include_usage) {
     if (manager == null) return 1;
     IOReturn open_rc = IOHIDManagerOpen(manager, K_IOHID_OPTIONS_TYPE_NONE);
     if (open_rc != K_IO_RETURN_SUCCESS) {
-        printf("IOHIDManagerOpen failed: 0x%08x\n", (uint)open_rc);
+        io::printfn("IOHIDManagerOpen failed: 0x%08x", (uint)open_rc);
         CFRelease(manager);
         return 1;
     }
     CFSetRef devices = IOHIDManagerCopyDevices(manager);
     if (devices == null) {
-        printf("No matching HID devices found.\n");
+        io::printfn("No matching HID devices found.");
         IOHIDManagerClose(manager, K_IOHID_OPTIONS_TYPE_NONE);
         CFRelease(manager);
         return 1;
     }
     CFIndex count = CFSetGetCount(devices);
-    printf("Found %ld matching HID device(s).\n", count);
+    io::printfn("Found %ld matching HID device(s).", count);
     CFRelease(devices);
     IOHIDManagerClose(manager, K_IOHID_OPTIONS_TYPE_NONE);
     CFRelease(manager);
@@ -81,12 +86,8 @@ fn int transport_list_devices(Options* opt, bool include_usage) {
 }
 
 fn int transport_open(ClockTransport* transport, Options* opt) {
-    memset(transport, 0, ClockTransport.sizeof);
-    MacosIokitTransport* macos = (MacosIokitTransport*)calloc(1, MacosIokitTransport.sizeof);
-    if (macos == null) {
-        printf("out of memory\n");
-        return -1;
-    }
+    *transport = {};
+    MacosIokitTransport* macos = mem::new(MacosIokitTransport);
     transport.kind = MACOS_IOKIT;
     transport.impl = macos;
     macos.report_id = opt.report_id;
@@ -100,36 +101,30 @@ fn int transport_open(ClockTransport* transport, Options* opt) {
 
     IOReturn open_rc = IOHIDManagerOpen(macos.manager, K_IOHID_OPTIONS_TYPE_NONE);
     if (open_rc != K_IO_RETURN_SUCCESS) {
-        printf("IOHIDManagerOpen failed: 0x%08x\n", (uint)open_rc);
+        io::printfn("IOHIDManagerOpen failed: 0x%08x", (uint)open_rc);
         transport_close(transport);
         return -1;
     }
 
     CFSetRef devices = IOHIDManagerCopyDevices(macos.manager);
     if (devices == null || CFSetGetCount(devices) == 0) {
-        printf("No matching HID device found\n");
+        io::printfn("No matching HID device found");
         if (devices != null) CFRelease(devices);
         transport_close(transport);
         return -1;
     }
 
     CFIndex count = CFSetGetCount(devices);
-    void** refs = (void**)calloc((usz)count, uptr.sizeof);
-    if (refs == null) {
-        printf("out of memory\n");
-        CFRelease(devices);
-        transport_close(transport);
-        return -1;
-    }
+    void** refs = mem::new_array(void*, (sz)count);
     CFSetGetValues(devices, refs);
     macos.device = (IOHIDDeviceRef)refs[0];
     CFRetain(macos.device);
-    free(refs);
+    mem::free(refs);
     CFRelease(devices);
 
     IOReturn dev_rc = IOHIDDeviceOpen(macos.device, K_IOHID_OPTIONS_TYPE_NONE);
     if (dev_rc != K_IO_RETURN_SUCCESS) {
-        printf("IOHIDDeviceOpen failed: 0x%08x\n", (uint)dev_rc);
+        io::printfn("IOHIDDeviceOpen failed: 0x%08x", (uint)dev_rc);
         transport_close(transport);
         return -1;
     }
@@ -145,7 +140,7 @@ fn int transport_open(ClockTransport* transport, Options* opt) {
 fn void transport_close(ClockTransport* transport) {
     MacosIokitTransport* macos = transport_macos(transport);
     if (macos == null) {
-        memset(transport, 0, ClockTransport.sizeof);
+        *transport = {};
         return;
     }
     if (macos.device != null) {
@@ -161,8 +156,8 @@ fn void transport_close(ClockTransport* transport) {
         IOHIDManagerClose(macos.manager, K_IOHID_OPTIONS_TYPE_NONE);
         CFRelease(macos.manager);
     }
-    free(macos);
-    memset(transport, 0, ClockTransport.sizeof);
+    mem::free(macos);
+    *transport = {};
 }
 
 fn int transport_get_feature_report(ClockTransport* transport, char report_id, char* report, usz* report_len) {
@@ -172,7 +167,7 @@ fn int transport_get_feature_report(ClockTransport* transport, char report_id, c
     IOReturn rc = IOHIDDeviceGetReport(macos.device, K_IOHID_REPORT_TYPE_FEATURE, (uint)report_id, report, &len);
     *report_len = (usz)len;
     if (rc != K_IO_RETURN_SUCCESS) {
-        printf("IOHIDDeviceGetReport feature report 0x%02x failed: 0x%08x\n", (uint)report_id, (uint)rc);
+        io::printfn("IOHIDDeviceGetReport feature report 0x%02x failed: 0x%08x", (uint)report_id, (uint)rc);
         return -1;
     }
     return 0;
@@ -184,8 +179,8 @@ fn int transport_send_wait_checked(ClockTransport* transport, char* packet, char
     macos.expected_cmd = expected_cmd;
     macos.got_response = false;
     macos.response_len = 0;
-    memset(&macos.response, 0, REPORT_SIZE);
-    memset(&macos.input_report, 0, REPORT_SIZE);
+    clear_bytes(macos.response[..]);
+    clear_bytes(macos.input_report[..]);
 
     char* report_data = packet;
     CFIndex report_len = REPORT_SIZE;
@@ -196,34 +191,34 @@ fn int transport_send_wait_checked(ClockTransport* transport, char* packet, char
 
     IOReturn rc = IOHIDDeviceSetReport(macos.device, K_IOHID_REPORT_TYPE_OUTPUT, (uint)macos.report_id, report_data, report_len);
     if (rc != K_IO_RETURN_SUCCESS) {
-        printf("IOHIDDeviceSetReport cmd=0x%02x failed: 0x%08x\n", (uint)expected_cmd, (uint)rc);
+        io::printfn("IOHIDDeviceSetReport cmd=0x%02x failed: 0x%08x", (uint)expected_cmd, (uint)rc);
         return -1;
     }
 
     CFStringRef mode = cfstr("kCFRunLoopDefaultMode");
-    double deadline = monotonic_seconds() + (double)timeout_ms / 1000.0;
-    while (!macos.got_response && monotonic_seconds() < deadline) {
+    Clock deadline = clock::now() + time::ms((long)timeout_ms);
+    while (!macos.got_response && clock::now() < deadline) {
         CFRunLoopRunInMode(mode, 0.01, true);
     }
     CFRelease(mode);
 
     if (!macos.got_response) {
-        printf("Timed out waiting for response to cmd=0x%02x\n", (uint)expected_cmd);
+        io::printfn("Timed out waiting for response to cmd=0x%02x", (uint)expected_cmd);
         return -1;
     }
 
     if (response != null && response_len != null) {
-        memcpy(response, &macos.response, macos.response_len);
+        for (usz i = 0; i < macos.response_len; i++) response[i] = macos.response[i];
         *response_len = macos.response_len;
     }
 
     if (check_status && macos.response_len >= 8) {
         if (macos.response[7] == 0xff) {
-            printf("Device returned status 0xff for cmd=0x%02x\n", (uint)expected_cmd);
+            io::printfn("Device returned status 0xff for cmd=0x%02x", (uint)expected_cmd);
             return -1;
         }
         if (macos.response[7] == 0xfe) {
-            printf("Device returned status 0xfe for cmd=0x%02x\n", (uint)expected_cmd);
+            io::printfn("Device returned status 0xfe for cmd=0x%02x", (uint)expected_cmd);
             return -1;
         }
     }
@@ -239,12 +234,6 @@ fn MacosIokitTransport* transport_macos(ClockTransport* transport) {
         return null;
     }
     return (MacosIokitTransport*)transport.impl;
-}
-
-fn double monotonic_seconds() {
-    Timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
 }
 
 fn CFStringRef cfstr(char* text) {
@@ -276,13 +265,13 @@ fn CFMutableDictionaryRef create_matching_dict(Options* opt, bool include_usage)
 fn IOHIDManagerRef create_manager_with_match(Options* opt, bool include_usage) {
     IOHIDManagerRef manager = IOHIDManagerCreate(null, K_IOHID_OPTIONS_TYPE_NONE);
     if (manager == null) {
-        printf("IOHIDManagerCreate failed\n");
+        io::printfn("IOHIDManagerCreate failed");
         return null;
     }
     CFMutableDictionaryRef match = create_matching_dict(opt, include_usage);
     if (match == null) {
         CFRelease(manager);
-        printf("Could not create HID matching dictionary\n");
+        io::printfn("Could not create HID matching dictionary");
         return null;
     }
     IOHIDManagerSetDeviceMatching(manager, match);
@@ -295,22 +284,22 @@ fn void input_report_callback(void* context, IOReturn result, void* sender, int 
     if (result != K_IO_RETURN_SUCCESS || report_len <= 0) return;
 
     char[REPORT_SIZE] normalized;
-    memset(&normalized, 0, REPORT_SIZE);
+    clear_bytes(normalized[..]);
     usz normalized_len = 0;
 
     if (report[0] == macos.report_id) {
         normalized_len = report_len > REPORT_SIZE ? REPORT_SIZE : (usz)report_len;
-        memcpy(&normalized, report, normalized_len);
+        for (usz i = 0; i < normalized_len; i++) normalized[i] = report[i];
     } else {
         normalized[0] = (char)report_id;
         usz copy_len = report_len > REPORT_SIZE - 1 ? REPORT_SIZE - 1 : (usz)report_len;
-        memcpy(&normalized + 1, report, copy_len);
+        for (usz i = 0; i < copy_len; i++) normalized[i + 1] = report[i];
         normalized_len = copy_len + 1;
     }
 
     if (normalized_len >= 4 &&
         (macos.expected_cmd == 0xff || normalized[3] == macos.expected_cmd)) {
-        memcpy(&macos.response, &normalized, normalized_len);
+        for (usz i = 0; i < normalized_len; i++) macos.response[i] = normalized[i];
         macos.response_len = normalized_len;
         macos.got_response = true;
     }

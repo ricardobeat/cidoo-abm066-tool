@@ -1,7 +1,7 @@
 {
   "version": "0.1.0",
   "langrev": "1",
-  "sources": [ "src/**" ],
+  "sources": [ "src/**", "vendor/getopt/src/**" ],
   "output": "build",
   "link-libc": true,
   "targets": {

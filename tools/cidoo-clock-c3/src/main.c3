@@ -1,5 +1,15 @@
 module cidoo_clock_c3;
 
+import std::core::mem;
+import std::hash::sha256;
+import std::io;
+import std::io::file;
+import std::thread;
+import std::time;
+import std::time::datetime;
+
+import opt;
+
 const int REPORT_SIZE = 64;
 const int RECORD_SIZE = 48;
 const int CONFIG_PAYLOAD_OFFSET = 8;
@@ -11,46 +21,27 @@ const ushort DEFAULT_USAGE_PAGE = 0xff1c;
 const ushort DEFAULT_USAGE = 0x92;
 const char DEFAULT_REPORT_ID = 0x04;
 const String WRITE_CONFIRM_TEXT = "PATCH_ONLY_BYTES_35_41";
-
-enum Command : int {
-    NONE,
-    HELP,
-    LIST,
-    PROBE,
-    GET_FEATURE,
-    READ_RAW,
-    DRY_RUN,
-    READ_TEMPLATE,
-    READ_TEMPLATE_SPLIT,
-    UPDATE_TIME,
-}
+const int RAW_OFFSET_UNSET = -1;
 
 struct Options {
-    Command command;
     ushort vid;
     ushort pid;
     ushort usage_page;
     ushort usage;
     char report_id;
     char raw_command;
-    usz raw_length;
-    ushort raw_offset;
-    bool raw_offset_set;
+    uint raw_length;
+    int raw_offset;
     int slot;
     int timeout_ms;
     String template_hex;
-    bool has_template_hex;
     String template_file;
-    bool has_template_file;
     String time_arg;
     String out_file;
-    bool has_out_file;
     String expected_template_sha256;
-    bool has_expected_template_sha256;
     String expected_stable_sha256;
-    bool has_expected_stable_sha256;
     String confirm_write;
-    bool has_confirm_write;
+    bool help;
     bool print_packets;
     bool allow_hid_query;
     bool allow_config_write;
@@ -58,39 +49,54 @@ struct Options {
 }
 
 fn int main(String[] args) {
-    Options opt;
-    init_options(&opt);
-    if (parse_options(args, &opt) != 0) return 2;
-
-    switch (opt.command) {
-        case HELP:
-            usage();
-            return 0;
-        case LIST:
-            return transport_list_devices(&opt, true);
-        case PROBE:
-            return transport_list_devices(&opt, false);
-        case GET_FEATURE:
-            return get_feature_report(&opt);
-        case READ_RAW:
-            return run_read_raw(&opt);
-        case DRY_RUN:
-            return run_dry_run(&opt);
-        case READ_TEMPLATE:
-            return run_read_template(&opt);
-        case READ_TEMPLATE_SPLIT:
-            printf("read-template-split is not ported in the C3 version; use read-template.\n");
-            return 2;
-        case UPDATE_TIME:
-            return run_update_time(&opt);
-        default:
-            usage();
-            return 2;
+    if (args.len < 2) {
+        usage();
+        return 2;
     }
+
+    String command = args[1];
+    if (str_eq(command, "help") || str_eq(command, "--help") || str_eq(command, "-h")) {
+        usage();
+        return 0;
+    }
+
+    Options options = {
+        .vid = DEFAULT_VID,
+        .pid = DEFAULT_PID,
+        .usage_page = DEFAULT_USAGE_PAGE,
+        .usage = DEFAULT_USAGE,
+        .report_id = DEFAULT_REPORT_ID,
+        .raw_length = (uint)RECORD_SIZE,
+        .raw_offset = RAW_OFFSET_UNSET,
+        .timeout_ms = 1500,
+        .time_arg = "now",
+    };
+
+    if (parse_options(args, &options) != 0) return 2;
+
+    if (options.help) {
+        usage();
+        return 0;
+    }
+    if (str_eq(command, "list")) return transport_list_devices(&options, true);
+    if (str_eq(command, "probe")) return transport_list_devices(&options, false);
+    if (str_eq(command, "get-feature")) return get_feature_report(&options);
+    if (str_eq(command, "read-raw")) return run_read_raw(&options);
+    if (str_eq(command, "dry-run")) return run_dry_run(&options);
+    if (str_eq(command, "read-template")) return run_read_template(&options);
+    if (str_eq(command, "read-template-split")) {
+        io::printfn("read-template-split is not ported in the C3 version; use read-template.");
+        return 2;
+    }
+    if (str_eq(command, "update-time")) return run_update_time(&options);
+
+    io::printfn("Unknown command: %s", command);
+    usage();
+    return 2;
 }
 
 fn void usage() {
-    printf(
+    io::printf(
         "Usage:\n"
         "  cidoo-clock-c3 list [options]\n"
         "  cidoo-clock-c3 probe [options]\n"
@@ -122,6 +128,7 @@ fn void usage() {
         "  --allow-hid-query                 permit command 0x05 query report\n"
         "  --allow-config-write              permit command 0x06 config write path\n"
         "  --confirm-write TEXT              must be PATCH_ONLY_BYTES_35_41\n"
+        "  -h, --help                       show this help\n"
         "  --strip-report-id-for-iohid       diagnostic: pass bytes 1..63 to IOKit\n",
         (uint)DEFAULT_VID,
         (uint)DEFAULT_PID,
@@ -130,186 +137,81 @@ fn void usage() {
         (uint)DEFAULT_REPORT_ID);
 }
 
-fn void init_options(Options* opt) {
-    memset(opt, 0, Options.sizeof);
-    opt.command = NONE;
-    opt.vid = DEFAULT_VID;
-    opt.pid = DEFAULT_PID;
-    opt.usage_page = DEFAULT_USAGE_PAGE;
-    opt.usage = DEFAULT_USAGE;
-    opt.report_id = DEFAULT_REPORT_ID;
-    opt.raw_length = RECORD_SIZE;
-    opt.slot = 0;
-    opt.timeout_ms = 1500;
-    opt.time_arg = "now";
+fn int parse_options(String[] args, Options* options) {
+    String[] option_args = args[1..];
+    opt::@disable_errors();
+    defer opt::@enable_errors();
+    int? parsed_options = opt::@parse(
+        option_args,
+        "h", "help", &options.help,
+        null, "vid", &options.vid,
+        null, "pid", &options.pid,
+        null, "usage-page", &options.usage_page,
+        null, "usage", &options.usage,
+        null, "report-id", &options.report_id,
+        null, "raw-command", &options.raw_command,
+        null, "raw-length", &options.raw_length,
+        null, "raw-offset", &options.raw_offset,
+        null, "slot", &options.slot,
+        null, "time", &options.time_arg,
+        null, "template", &options.template_hex,
+        null, "template-file", &options.template_file,
+        null, "out", &options.out_file,
+        null, "expected-template-sha256", &options.expected_template_sha256,
+        null, "expected-stable-sha256", &options.expected_stable_sha256,
+        null, "confirm-write", &options.confirm_write,
+        null, "print-packets", &options.print_packets,
+        null, "timeout-ms", &options.timeout_ms,
+        null, "allow-hid-query", &options.allow_hid_query,
+        null, "allow-config-write", &options.allow_config_write,
+        null, "strip-report-id-for-iohid", &options.strip_report_id_for_iohid
+    );
+    if (catch err = parsed_options) {
+        switch (err) {
+            case opt::MISSING_ARGUMENT:
+                io::printfn("Missing option argument");
+            case opt::ILLEGAL_OPTION:
+                io::printfn("Unknown option");
+            default:
+                io::printfn("Invalid option: %s", err);
+        }
+        usage();
+        return -1;
+    }
+
+    int end_index = parsed_options;
+    if (options.help) return 0;
+
+    if (end_index < option_args.len) {
+        io::printfn("Unexpected argument: %s", option_args[end_index]);
+        return -1;
+    }
+
+    return validate_options(options);
 }
 
-fn int parse_options(String[] args, Options* opt) {
-    if (args.len < 2) {
-        usage();
+fn int validate_options(Options* options) {
+    if (options.raw_length > REPORT_SIZE - CONFIG_PAYLOAD_OFFSET) {
+        io::printfn("Invalid --raw-length: %u", options.raw_length);
         return -1;
     }
-
-    opt.command = parse_command(args[1]);
-    if (opt.command == NONE) {
-        printf("Unknown command: %.*s\n", (int)args[1].len, args[1].ptr);
-        usage();
+    if (options.raw_offset < RAW_OFFSET_UNSET || options.raw_offset > 0xffff) {
+        io::printfn("Invalid --raw-offset: %d", options.raw_offset);
         return -1;
     }
-
-    for (usz i = 2; i < args.len; i++) {
-        String arg = args[i];
-        if (str_eq(arg, "--help") || str_eq(arg, "-h")) {
-            opt.command = HELP;
-        } else if (str_eq(arg, "--vid")) {
-            if (!need_value(args, &i, arg)) return -1;
-            opt.vid = (ushort)parse_uint_or_die(args[i], arg, 0xffff);
-        } else if (str_eq(arg, "--pid")) {
-            if (!need_value(args, &i, arg)) return -1;
-            opt.pid = (ushort)parse_uint_or_die(args[i], arg, 0xffff);
-        } else if (str_eq(arg, "--usage-page")) {
-            if (!need_value(args, &i, arg)) return -1;
-            opt.usage_page = (ushort)parse_uint_or_die(args[i], arg, 0xffff);
-        } else if (str_eq(arg, "--usage")) {
-            if (!need_value(args, &i, arg)) return -1;
-            opt.usage = (ushort)parse_uint_or_die(args[i], arg, 0xffff);
-        } else if (str_eq(arg, "--report-id")) {
-            if (!need_value(args, &i, arg)) return -1;
-            opt.report_id = (char)parse_uint_or_die(args[i], arg, 0xff);
-        } else if (str_eq(arg, "--raw-command")) {
-            if (!need_value(args, &i, arg)) return -1;
-            opt.raw_command = (char)parse_uint_or_die(args[i], arg, 0xff);
-        } else if (str_eq(arg, "--raw-length")) {
-            if (!need_value(args, &i, arg)) return -1;
-            opt.raw_length = (usz)parse_int_range_or_die(args[i], arg, 0, REPORT_SIZE - CONFIG_PAYLOAD_OFFSET);
-        } else if (str_eq(arg, "--raw-offset")) {
-            if (!need_value(args, &i, arg)) return -1;
-            opt.raw_offset = (ushort)parse_uint_or_die(args[i], arg, 0xffff);
-            opt.raw_offset_set = true;
-        } else if (str_eq(arg, "--slot")) {
-            if (!need_value(args, &i, arg)) return -1;
-            opt.slot = parse_int_range_or_die(args[i], arg, 0, 1024);
-        } else if (str_eq(arg, "--time")) {
-            if (!need_value(args, &i, arg)) return -1;
-            opt.time_arg = args[i];
-        } else if (str_eq(arg, "--template")) {
-            if (!need_value(args, &i, arg)) return -1;
-            opt.template_hex = args[i];
-            opt.has_template_hex = true;
-        } else if (str_eq(arg, "--template-file")) {
-            if (!need_value(args, &i, arg)) return -1;
-            opt.template_file = args[i];
-            opt.has_template_file = true;
-        } else if (str_eq(arg, "--out")) {
-            if (!need_value(args, &i, arg)) return -1;
-            opt.out_file = args[i];
-            opt.has_out_file = true;
-        } else if (str_eq(arg, "--expected-template-sha256")) {
-            if (!need_value(args, &i, arg)) return -1;
-            opt.expected_template_sha256 = args[i];
-            opt.has_expected_template_sha256 = true;
-        } else if (str_eq(arg, "--expected-stable-sha256")) {
-            if (!need_value(args, &i, arg)) return -1;
-            opt.expected_stable_sha256 = args[i];
-            opt.has_expected_stable_sha256 = true;
-        } else if (str_eq(arg, "--confirm-write")) {
-            if (!need_value(args, &i, arg)) return -1;
-            opt.confirm_write = args[i];
-            opt.has_confirm_write = true;
-        } else if (str_eq(arg, "--print-packets")) {
-            opt.print_packets = true;
-        } else if (str_eq(arg, "--timeout-ms")) {
-            if (!need_value(args, &i, arg)) return -1;
-            opt.timeout_ms = parse_int_range_or_die(args[i], arg, 100, 30000);
-        } else if (str_eq(arg, "--allow-hid-query")) {
-            opt.allow_hid_query = true;
-        } else if (str_eq(arg, "--allow-config-write")) {
-            opt.allow_config_write = true;
-        } else if (str_eq(arg, "--strip-report-id-for-iohid")) {
-            opt.strip_report_id_for_iohid = true;
-        } else {
-            printf("Unexpected argument: %.*s\n", (int)arg.len, arg.ptr);
-            return -1;
-        }
+    if (options.slot < 0 || options.slot > 1024) {
+        io::printfn("Invalid --slot: %d", options.slot);
+        return -1;
     }
-
-    if ((uint)opt.slot * 0x31 > 0xffff - (RECORD_SIZE - 1)) {
-        printf("--slot is too large for the 16-bit config offset\n");
+    if (options.timeout_ms < 100 || options.timeout_ms > 30000) {
+        io::printfn("Invalid --timeout-ms: %d", options.timeout_ms);
+        return -1;
+    }
+    if ((uint)options.slot * 0x31 > 0xffff - (RECORD_SIZE - 1)) {
+        io::printfn("--slot is too large for the 16-bit config offset");
         return -1;
     }
     return 0;
-}
-
-fn bool need_value(String[] args, usz* i, String arg) {
-    if (*i + 1 >= args.len) {
-        printf("Missing value for %.*s\n", (int)arg.len, arg.ptr);
-        return false;
-    }
-    *i += 1;
-    return true;
-}
-
-fn Command parse_command(String s) {
-    if (str_eq(s, "help") || str_eq(s, "--help") || str_eq(s, "-h")) return HELP;
-    if (str_eq(s, "list")) return LIST;
-    if (str_eq(s, "probe")) return PROBE;
-    if (str_eq(s, "get-feature")) return GET_FEATURE;
-    if (str_eq(s, "read-raw")) return READ_RAW;
-    if (str_eq(s, "dry-run")) return DRY_RUN;
-    if (str_eq(s, "read-template")) return READ_TEMPLATE;
-    if (str_eq(s, "read-template-split")) return READ_TEMPLATE_SPLIT;
-    if (str_eq(s, "update-time")) return UPDATE_TIME;
-    return NONE;
-}
-
-fn uint parse_uint_or_die(String s, String name, uint max) {
-    uint value = 0;
-    if (!parse_uint(s, max, &value)) {
-        printf("Invalid %.*s: %.*s\n", (int)name.len, name.ptr, (int)s.len, s.ptr);
-        exit(2);
-        return 0;
-    }
-    return value;
-}
-
-fn int parse_int_range_or_die(String s, String name, int min, int max) {
-    uint value = 0;
-    if (!parse_uint(s, (uint)max, &value) || (int)value < min) {
-        printf("Invalid %.*s: %.*s\n", (int)name.len, name.ptr, (int)s.len, s.ptr);
-        exit(2);
-        return 0;
-    }
-    return (int)value;
-}
-
-fn bool parse_uint(String s, uint max, uint* out) {
-    if (s.len == 0) return false;
-    usz index = 0;
-    uint base = 10;
-    if (s.len >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
-        index = 2;
-        base = 16;
-    }
-    if (index >= s.len) return false;
-    uint value = 0;
-    for (; index < s.len; index++) {
-        int digit = -1;
-        char c = s[index];
-        if (c >= '0' && c <= '9') {
-            digit = (int)(c - '0');
-        } else if (base == 16 && c >= 'a' && c <= 'f') {
-            digit = (int)(c - 'a' + 10);
-        } else if (base == 16 && c >= 'A' && c <= 'F') {
-            digit = (int)(c - 'A' + 10);
-        } else {
-            return false;
-        }
-        if ((uint)digit >= base) return false;
-        if (value > (max - (uint)digit) / base) return false;
-        value = value * base + (uint)digit;
-    }
-    *out = value;
-    return true;
 }
 
 fn bool str_eq(String a, String b) {
@@ -318,6 +220,27 @@ fn bool str_eq(String a, String b) {
         if (a[i] != b[i]) return false;
     }
     return true;
+}
+
+fn void clear_bytes(char[] bytes) {
+    for (usz i = 0; i < bytes.len; i++) bytes[i] = 0;
+}
+
+fn void copy_bytes(char[] dst, char[] src) {
+    usz len = dst.len < src.len ? dst.len : src.len;
+    if (len > 0) mem::copy(dst.ptr, src.ptr, (sz)len);
+}
+
+fn bool bytes_equal(char[] a, char[] b) {
+    if (a.len != b.len) return false;
+    for (usz i = 0; i < a.len; i++) {
+        if (a[i] != b[i]) return false;
+    }
+    return true;
+}
+
+fn bool string_was_set(String value) {
+    return value.ptr != null;
 }
 
 fn bool hex_eq_ci(String a, char* b) {
@@ -338,8 +261,8 @@ fn bool is_time_offset(usz i) {
     return i >= TIME_OFFSET && i < TIME_OFFSET + TIME_SIZE;
 }
 
-fn bool record_all_zero(char* record) {
-    for (usz i = 0; i < RECORD_SIZE; i++) {
+fn bool record_all_zero(char[] record) {
+    for (usz i = 0; i < record.len; i++) {
         if (record[i] != 0) return false;
     }
     return true;
@@ -361,7 +284,7 @@ fn bool bcd_in_range(char value, int min, int max) {
     return decoded >= min && decoded <= max;
 }
 
-fn String time_validation_error(char* record) {
+fn String time_validation_error(char[] record) {
     if (!bcd_in_range(record[35], 0, 59)) return "seconds byte 35 is not valid BCD 00..59";
     if (!bcd_in_range(record[36], 0, 59)) return "minutes byte 36 is not valid BCD 00..59";
     if (!bcd_in_range(record[37], 0, 23)) return "hours byte 37 is not valid BCD 00..23";
@@ -372,7 +295,7 @@ fn String time_validation_error(char* record) {
     return "ok";
 }
 
-fn void print_time_fields(String label, char* record) {
+fn void print_time_fields(String label, char[] record) {
     int sec = unbcd(record[35]);
     int min = unbcd(record[36]);
     int hour = unbcd(record[37]);
@@ -380,9 +303,8 @@ fn void print_time_fields(String label, char* record) {
     int mon = unbcd(record[40]);
     int year = unbcd(record[41]);
 
-    printf("%.*s: bytes hh=%02x mm=%02x ss=%02x weekday=%u day=%02x month=%02x year=%02x",
-        (int)label.len,
-        label.ptr,
+    io::printf("%s: bytes hh=%02x mm=%02x ss=%02x weekday=%u day=%02x month=%02x year=%02x",
+        label,
         (uint)record[37],
         (uint)record[36],
         (uint)record[35],
@@ -393,40 +315,40 @@ fn void print_time_fields(String label, char* record) {
     if (sec >= 0 && min >= 0 && hour >= 0 && day >= 0 && mon >= 0 && year >= 0 &&
         hour <= 23 && min <= 59 && sec <= 59 && record[38] <= 6 &&
         day >= 1 && day <= 31 && mon >= 1 && mon <= 12) {
-        printf(" decoded=20%02d-%02d-%02d %02d:%02d:%02d weekday=%u",
+        io::printf(" decoded=20%02d-%02d-%02d %02d:%02d:%02d weekday=%u",
             year, mon, day, hour, min, sec, (uint)record[38]);
     }
-    printf("\n");
+    io::printn();
 }
 
-fn void print_hex(String label, char* buf, usz len) {
-    if (label.len > 0) printf("%.*s", (int)label.len, label.ptr);
-    for (usz i = 0; i < len; i++) {
-        if (i > 0) printf(" ");
-        printf("%02x", (uint)buf[i]);
+fn void print_hex(String label, char[] buf) {
+    if (label.len > 0) io::printf("%s", label);
+    for (usz i = 0; i < buf.len; i++) {
+        if (i > 0) io::print(" ");
+        io::printf("%02x", (uint)buf[i]);
     }
-    printf("\n");
+    io::printn();
 }
 
 fn char hex_digit(int v) {
     return (char)(v < 10 ? '0' + v : 'a' + (v - 10));
 }
 
-fn void sha256_hex(char* buf, usz len, char* out) {
-    char[CC_SHA256_DIGEST_LENGTH] digest;
-    CC_SHA256(buf, (uint)len, &digest);
-    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) {
-        out[i * 2] = hex_digit((digest[i] >> 4) & 0x0f);
-        out[i * 2 + 1] = hex_digit(digest[i] & 0x0f);
+fn void sha256_hex(char[] buf, char* out) {
+    char[sha256::HASH_SIZE] digest = sha256::hash(buf);
+    for (int i = 0; i < sha256::HASH_SIZE; i++) {
+        int byte = (int)digest[i];
+        out[i * 2] = hex_digit((byte >> 4) & 0x0f);
+        out[i * 2 + 1] = hex_digit(byte & 0x0f);
     }
     out[64] = 0;
 }
 
-fn void stable_sha256_hex(char* record, char* out) {
+fn void stable_sha256_hex(char[] record, char* out) {
     char[RECORD_SIZE] masked;
     for (usz i = 0; i < RECORD_SIZE; i++) masked[i] = record[i];
     for (usz i = TIME_OFFSET; i < TIME_OFFSET + TIME_SIZE; i++) masked[i] = 0;
-    sha256_hex(&masked, RECORD_SIZE, out);
+    sha256_hex(masked[..], out);
 }
 
 fn int hex_nibble(char c) {
@@ -444,7 +366,7 @@ fn bool is_hex_separator(char c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ':' || c == ',' || c == '-';
 }
 
-fn int parse_hex_record_text(String text, char* out) {
+fn int parse_hex_record_text(String text, char[] out) {
     char[RECORD_SIZE * 2] digits;
     usz count = 0;
 
@@ -456,7 +378,7 @@ fn int parse_hex_record_text(String text, char* out) {
         }
         if (is_hex_digit(c)) {
             if (count >= RECORD_SIZE * 2) {
-                printf("Template has more than 48 bytes of hex\n");
+                io::printfn("Template has more than 48 bytes of hex");
                 return -1;
             }
             digits[count] = c;
@@ -464,12 +386,12 @@ fn int parse_hex_record_text(String text, char* out) {
             continue;
         }
         if (is_hex_separator(c)) continue;
-        printf("Template contains non-hex character: %c\n", (int)c);
+        io::printfn("Template contains non-hex character: %c", (int)c);
         return -1;
     }
 
     if (count != RECORD_SIZE * 2) {
-        printf("Template must contain exactly 48 bytes, got %zu hex digits\n", count);
+        io::printfn("Template must contain exactly 48 bytes, got %zu hex digits", count);
         return -1;
     }
     for (usz i = 0; i < RECORD_SIZE; i++) {
@@ -481,8 +403,8 @@ fn int parse_hex_record_text(String text, char* out) {
     return 0;
 }
 
-fn bool looks_like_hex_text(char* buf, usz len) {
-    for (usz i = 0; i < len; i++) {
+fn bool looks_like_hex_text(char[] buf) {
+    for (usz i = 0; i < buf.len; i++) {
         char c = buf[i];
         if (is_hex_digit(c) || is_hex_separator(c) || c == 'x' || c == 'X') continue;
         return false;
@@ -490,37 +412,32 @@ fn bool looks_like_hex_text(char* buf, usz len) {
     return true;
 }
 
-fn int load_record_template(Options* opt, char* out) {
-    if (opt.has_template_hex && opt.has_template_file) {
-        printf("Use either --template or --template-file, not both\n");
+fn int load_record_template(Options* opt, char[] out) {
+    bool has_template_hex = string_was_set(opt.template_hex);
+    bool has_template_file = string_was_set(opt.template_file);
+    if (has_template_hex && has_template_file) {
+        io::printfn("Use either --template or --template-file, not both");
         return -1;
     }
-    if (opt.has_template_hex) return parse_hex_record_text(opt.template_hex, out);
-    if (!opt.has_template_file) {
-        printf("dry-run needs --template or --template-file\n");
+    if (has_template_hex) return parse_hex_record_text(opt.template_hex, out);
+    if (!has_template_file) {
+        io::printfn("dry-run needs --template or --template-file");
         return -1;
     }
 
-    FilePtr f = fopen(opt.template_file.ptr, "rb");
-    if (f == null) {
-        perror(opt.template_file.ptr);
-        return -1;
-    }
     char[4096] buf;
-    usz len = fread(&buf, 1, 4096, f);
-    if (ferror(f) != 0) {
-        perror(opt.template_file.ptr);
-        fclose(f);
+    char[]? loaded = file::load_buffer(opt.template_file, buf[..]);
+    if (catch err = loaded) {
+        io::printfn("Could not read template file %s: %s", opt.template_file, err);
         return -1;
     }
-    fclose(f);
 
-    if (len == RECORD_SIZE && !looks_like_hex_text(&buf, len)) {
-        memcpy(out, &buf, RECORD_SIZE);
+    if (loaded.len == RECORD_SIZE && !looks_like_hex_text(loaded)) {
+        copy_bytes(out, loaded);
         return 0;
     }
 
-    String text = buf[0:len];
+    String text = (String)loaded;
     return parse_hex_record_text(text, out);
 }
 
@@ -539,21 +456,24 @@ fn int parse_fixed_4(String s, usz offset) {
     return a * 100 + b;
 }
 
-fn int fill_time_bytes(String arg, char* out) {
-    Tm tmv;
-    memset(&tmv, 0, Tm.sizeof);
-
+fn int fill_time_bytes(String arg, char[] out) {
     if (str_eq(arg, "now")) {
-        TimeT now = time(null);
-        if (localtime_r(&now, &tmv) == null) {
-            perror("localtime_r");
-            return -1;
-        }
+        TzDateTime local = datetime::now().to_local();
+        write_time_bytes(
+            (int)local.sec,
+            (int)local.min,
+            (int)local.hour,
+            weekday_clock_value(local.weekday),
+            (int)local.day,
+            (int)local.month.ordinal + 1,
+            local.year,
+            out);
+        return 0;
     } else {
         if (arg.len != 19 || arg[4] != '-' || arg[7] != '-' ||
             !(arg[10] == 'T' || arg[10] == ' ') ||
             arg[13] != ':' || arg[16] != ':') {
-            printf("Invalid --time, expected now or YYYY-MM-DDTHH:MM:SS in local time\n");
+            io::printfn("Invalid --time, expected now or YYYY-MM-DDTHH:MM:SS in local time");
             return -1;
         }
         int year = parse_fixed_4(arg, 0);
@@ -563,64 +483,79 @@ fn int fill_time_bytes(String arg, char* out) {
         int min = parse_fixed_2(arg, 14);
         int sec = parse_fixed_2(arg, 17);
         if (year < 2000 || year > 2099 || mon < 1 || mon > 12 ||
-            day < 1 || day > 31 || hour < 0 || hour > 23 ||
+            day < 1 || day > days_in_month(year, mon) || hour < 0 || hour > 23 ||
             min < 0 || min > 59 || sec < 0 || sec > 59) {
-            printf("Invalid --time, expected now or YYYY-MM-DDTHH:MM:SS in local time\n");
+            io::printfn("Invalid --time, expected now or YYYY-MM-DDTHH:MM:SS in local time");
             return -1;
         }
-
-        Tm requested;
-        memset(&requested, 0, Tm.sizeof);
-        requested.tm_year = year - 1900;
-        requested.tm_mon = mon - 1;
-        requested.tm_mday = day;
-        requested.tm_hour = hour;
-        requested.tm_min = min;
-        requested.tm_sec = sec;
-        requested.tm_isdst = -1;
-        TimeT t = mktime(&requested);
-        if (t == (TimeT)-1 || localtime_r(&t, &tmv) == null) {
-            printf("Could not normalize --time value\n");
-            return -1;
-        }
-        if (tmv.tm_year != year - 1900 || tmv.tm_mon != mon - 1 ||
-            tmv.tm_mday != day || tmv.tm_hour != hour ||
-            tmv.tm_min != min || tmv.tm_sec != sec) {
-            printf("Invalid --time, date/time is not representable in local time\n");
-            return -1;
-        }
+        write_time_bytes(sec, min, hour, weekday_sunday_zero(year, mon, day), day, mon, year, out);
+        return 0;
     }
-
-    out[0] = bcd(tmv.tm_sec);
-    out[1] = bcd(tmv.tm_min);
-    out[2] = bcd(tmv.tm_hour);
-    out[3] = (char)tmv.tm_wday;
-    out[4] = bcd(tmv.tm_mday);
-    out[5] = bcd(tmv.tm_mon + 1);
-    out[6] = bcd((tmv.tm_year + 1900) % 100);
-    return 0;
 }
 
-fn void patch_time(char* input, char* time_bytes, char* output) {
+fn void write_time_bytes(int sec, int min, int hour, int weekday, int day, int mon, int year, char[] out) {
+    out[0] = bcd(sec);
+    out[1] = bcd(min);
+    out[2] = bcd(hour);
+    out[3] = (char)weekday;
+    out[4] = bcd(day);
+    out[5] = bcd(mon);
+    out[6] = bcd(year % 100);
+}
+
+fn int weekday_clock_value(Weekday weekday) {
+    if (weekday == Weekday.SUNDAY) return 0;
+    return (int)weekday.ordinal + 1;
+}
+
+fn int weekday_sunday_zero(int year, int mon, int day) {
+    int[12] offsets = { 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 };
+    if (mon < 3) year -= 1;
+    return (year + year / 4 - year / 100 + year / 400 + offsets[mon - 1] + day) % 7;
+}
+
+fn int days_in_month(int year, int mon) {
+    switch (mon) {
+        case 1: return 31;
+        case 2: return is_leap_year(year) ? 29 : 28;
+        case 3: return 31;
+        case 4: return 30;
+        case 5: return 31;
+        case 6: return 30;
+        case 7: return 31;
+        case 8: return 31;
+        case 9: return 30;
+        case 10: return 31;
+        case 11: return 30;
+        case 12: return 31;
+        default: return 0;
+    }
+}
+
+fn bool is_leap_year(int year) {
+    return year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+}
+
+fn void patch_time(char[] input, char[] time_bytes, char[] output) {
     for (usz i = 0; i < RECORD_SIZE; i++) output[i] = input[i];
     for (usz i = 0; i < TIME_SIZE; i++) output[TIME_OFFSET + i] = time_bytes[i];
 }
 
-fn int verify_only_time_changed(char* before, char* after) {
+fn int verify_only_time_changed(char[] before, char[] after) {
     for (usz i = 0; i < RECORD_SIZE; i++) {
         if (!is_time_offset(i) && before[i] != after[i]) {
-            printf("Refusing: non-time byte changed at offset %zu\n", i);
+            io::printfn("Refusing: non-time byte changed at offset %zu", i);
             return -1;
         }
     }
     return 0;
 }
 
-fn void print_record_diff(char* before, char* after) {
-    printf("Changed offsets:\n");
+fn void print_record_diff(char[] before, char[] after) {
+    io::printfn("Changed offsets:");
     for (usz i = 0; i < RECORD_SIZE; i++) {
         if (before[i] != after[i]) {
-            printf("  %02zu: %02x -> %02x%s\n",
+            io::printfn("  %02zu: %02x -> %02x%s",
                 i,
                 (uint)before[i],
                 (uint)after[i],
@@ -630,13 +565,10 @@ fn void print_record_diff(char* before, char* after) {
 }
 
 fn void sleep_millis(long millis) {
-    Timespec ts;
-    ts.tv_sec = millis / 1000;
-    ts.tv_nsec = (millis % 1000) * 1000000;
-    nanosleep(&ts, null);
+    thread::sleep_ms(millis);
 }
 
-fn void checksum_packet(char* packet) {
+fn void checksum_packet(char[] packet) {
     ushort sum = 0;
     for (usz i = 3; i < REPORT_SIZE; i++) {
         sum = (ushort)(sum + (ushort)packet[i]);
@@ -645,25 +577,26 @@ fn void checksum_packet(char* packet) {
     packet[2] = (char)((sum >> 8) & 0xff);
 }
 
-fn void build_simple_packet(char report_id, char cmd, char* packet) {
-    memset(packet, 0, REPORT_SIZE);
+fn void build_simple_packet(char report_id, char cmd, char[] packet) {
+    clear_bytes(packet);
     packet[0] = report_id;
     packet[3] = cmd;
     checksum_packet(packet);
 }
 
-fn void build_config_packet(char report_id, char cmd, char* payload, usz payload_len, ushort offset, char* packet) {
-    memset(packet, 0, REPORT_SIZE);
+fn void build_config_packet(char report_id, char cmd, char[] payload, usz payload_len, ushort offset, char[] packet) {
+    clear_bytes(packet);
     packet[0] = report_id;
     packet[3] = cmd;
     packet[4] = (char)payload_len;
     packet[5] = (char)(offset & 0xff);
     packet[6] = (char)((offset >> 8) & 0xff);
     packet[7] = 0;
-    if (payload != null && payload_len > 0) {
+    if (payload.len > 0 && payload_len > 0) {
         usz copy_len = payload_len;
         if (copy_len > REPORT_SIZE - CONFIG_PAYLOAD_OFFSET) copy_len = REPORT_SIZE - CONFIG_PAYLOAD_OFFSET;
-        memcpy(packet + CONFIG_PAYLOAD_OFFSET, payload, copy_len);
+        if (copy_len > payload.len) copy_len = payload.len;
+        copy_bytes(packet[CONFIG_PAYLOAD_OFFSET..], payload[:copy_len]);
     }
     checksum_packet(packet);
 }
@@ -672,62 +605,62 @@ fn ushort slot_offset(int slot) {
     return (ushort)(slot * 0x31);
 }
 
-fn int read_template_from_device(Options* opt, ClockTransport* transport, char* record) {
+fn int read_template_from_device(Options* opt, ClockTransport* transport, char[] record) {
     char[REPORT_SIZE] packet;
     char[REPORT_SIZE] response;
     ushort offset = slot_offset(opt.slot);
-    memset(record, 0, RECORD_SIZE);
+    clear_bytes(record);
 
     for (usz pos = 0; pos < RECORD_SIZE; pos += 4) {
         usz chunk_len = RECORD_SIZE - pos;
         if (chunk_len > 4) chunk_len = 4;
         usz response_len = 0;
-        build_config_packet(opt.report_id, 0x05, null, chunk_len, (ushort)(offset + pos), &packet);
+        build_config_packet(opt.report_id, 0x05, "", chunk_len, (ushort)(offset + pos), packet[..]);
         if (opt.print_packets) {
-            printf("cmd 0x05 chunk offset=0x%04x packet: ", (uint)(offset + pos));
-            print_hex("", &packet, REPORT_SIZE);
+            io::printf("cmd 0x05 chunk offset=0x%04x packet: ", (uint)(offset + pos));
+            print_hex("", packet[..]);
         }
         if (transport_send_wait_checked(transport, &packet, 0x05, opt.timeout_ms, &response, &response_len, false) != 0) {
             return -1;
         }
         if (opt.print_packets) {
-            printf("cmd 0x05 chunk offset=0x%04x response: ", (uint)(offset + pos));
-            print_hex("", &response, response_len);
+            io::printf("cmd 0x05 chunk offset=0x%04x response: ", (uint)(offset + pos));
+            print_hex("", response[0:response_len]);
         }
-        if (response_len == REPORT_SIZE && memcmp(&response, &packet, REPORT_SIZE) == 0) {
-            printf("Refusing echoed read response: this HID collection did not return a real template\n");
+        if (response_len == REPORT_SIZE && bytes_equal(response[..], packet[..])) {
+            io::printfn("Refusing echoed read response: this HID collection did not return a real template");
             return -1;
         }
         if (response_len < 4 + chunk_len) {
-            printf("Read response too short at offset 0x%04x: got %zu bytes, need at least %zu\n",
+            io::printfn("Read response too short at offset 0x%04x: got %zu bytes, need at least %zu",
                 (uint)(offset + pos), response_len, 4 + chunk_len);
             return -1;
         }
-        memcpy(record + pos, &response + 4, chunk_len);
+        copy_bytes(record[pos..], response[4:chunk_len]);
     }
 
     if (record_all_zero(record)) {
-        printf("Refusing all-zero template: this is not a valid screen/clock config record\n");
+        io::printfn("Refusing all-zero template: this is not a valid screen/clock config record");
         return -1;
     }
     return 0;
 }
 
-fn int write_time_to_device(Options* opt, ClockTransport* transport, char* patched) {
+fn int write_time_to_device(Options* opt, ClockTransport* transport, char[] patched) {
     char[REPORT_SIZE] begin;
     char[REPORT_SIZE] write;
     char[REPORT_SIZE] commit;
     char[REPORT_SIZE] response;
     usz response_len = 0;
 
-    build_simple_packet(opt.report_id, 0x01, &begin);
-    build_config_packet(opt.report_id, 0x06, patched, RECORD_SIZE, slot_offset(opt.slot), &write);
-    build_simple_packet(opt.report_id, 0x02, &commit);
+    build_simple_packet(opt.report_id, 0x01, begin[..]);
+    build_config_packet(opt.report_id, 0x06, patched, RECORD_SIZE, slot_offset(opt.slot), write[..]);
+    build_simple_packet(opt.report_id, 0x02, commit[..]);
 
     if (opt.print_packets) {
-        print_hex("cmd 0x01 packet: ", &begin, REPORT_SIZE);
-        print_hex("cmd 0x06 packet: ", &write, REPORT_SIZE);
-        print_hex("cmd 0x02 packet: ", &commit, REPORT_SIZE);
+        print_hex("cmd 0x01 packet: ", begin[..]);
+        print_hex("cmd 0x06 packet: ", write[..]);
+        print_hex("cmd 0x02 packet: ", commit[..]);
     }
 
     if (transport_send_wait(transport, &begin, 0x01, opt.timeout_ms, &response, &response_len) != 0) return -1;
@@ -747,43 +680,43 @@ fn int run_dry_run(Options* opt) {
     char[65] stable_hash_before;
     char[65] stable_hash_after;
 
-    if (load_record_template(opt, &template_record) != 0) return 1;
-    if (record_all_zero(&template_record)) {
-        printf("Refusing all-zero template: this is not a valid screen/clock config record\n");
+    if (load_record_template(opt, template_record[..]) != 0) return 1;
+    if (record_all_zero(template_record[..])) {
+        io::printfn("Refusing all-zero template: this is not a valid screen/clock config record");
         return 1;
     }
-    if (fill_time_bytes(opt.time_arg, &time_bytes) != 0) return 1;
-    patch_time(&template_record, &time_bytes, &patched);
-    if (verify_only_time_changed(&template_record, &patched) != 0) return 1;
+    if (fill_time_bytes(opt.time_arg, time_bytes[..]) != 0) return 1;
+    patch_time(template_record[..], time_bytes[..], patched[..]);
+    if (verify_only_time_changed(template_record[..], patched[..]) != 0) return 1;
 
-    sha256_hex(&template_record, RECORD_SIZE, &hash_before);
-    sha256_hex(&patched, RECORD_SIZE, &hash_after);
-    stable_sha256_hex(&template_record, &stable_hash_before);
-    stable_sha256_hex(&patched, &stable_hash_after);
-    print_hex("template: ", &template_record, RECORD_SIZE);
-    print_hex("patched:  ", &patched, RECORD_SIZE);
-    printf("template sha256: %s\n", &hash_before);
-    printf("patched  sha256: %s\n", &hash_after);
-    printf("template stable sha256: %s\n", &stable_hash_before);
-    printf("patched  stable sha256: %s\n", &stable_hash_after);
-    print_time_fields("old time bytes", &template_record);
-    print_time_fields("new time bytes", &patched);
-    print_record_diff(&template_record, &patched);
+    sha256_hex(template_record[..], &hash_before);
+    sha256_hex(patched[..], &hash_after);
+    stable_sha256_hex(template_record[..], &stable_hash_before);
+    stable_sha256_hex(patched[..], &stable_hash_after);
+    print_hex("template: ", template_record[..]);
+    print_hex("patched:  ", patched[..]);
+    io::printfn("template sha256: %s", &hash_before);
+    io::printfn("patched  sha256: %s", &hash_after);
+    io::printfn("template stable sha256: %s", &stable_hash_before);
+    io::printfn("patched  stable sha256: %s", &stable_hash_after);
+    print_time_fields("old time bytes", template_record[..]);
+    print_time_fields("new time bytes", patched[..]);
+    print_record_diff(template_record[..], patched[..]);
 
-    String why = time_validation_error(&template_record);
-    if (!str_eq(why, "ok")) printf("template time validation warning: %.*s\n", (int)why.len, why.ptr);
+    String why = time_validation_error(template_record[..]);
+    if (!str_eq(why, "ok")) io::printfn("template time validation warning: %s", why);
 
     if (opt.print_packets) {
-        build_config_packet(opt.report_id, 0x06, &patched, RECORD_SIZE, slot_offset(opt.slot), &packet);
-        print_hex("cmd 0x06 packet: ", &packet, REPORT_SIZE);
+        build_config_packet(opt.report_id, 0x06, patched[..], RECORD_SIZE, slot_offset(opt.slot), packet[..]);
+        print_hex("cmd 0x06 packet: ", packet[..]);
     }
-    printf("No HID device was opened. No report was sent.\n");
+    io::printfn("No HID device was opened. No report was sent.");
     return 0;
 }
 
 fn int run_read_template(Options* opt) {
     if (!opt.allow_hid_query) {
-        printf("Refusing HID query without --allow-hid-query\n");
+        io::printfn("Refusing HID query without --allow-hid-query");
         return 2;
     }
 
@@ -793,51 +726,45 @@ fn int run_read_template(Options* opt) {
     char[65] stable_hash;
 
     if (transport_open(&transport, opt) != 0) return 1;
-    int rc = read_template_from_device(opt, &transport, &record);
+    int rc = read_template_from_device(opt, &transport, record[..]);
     transport_close(&transport);
     if (rc != 0) return 1;
 
-    sha256_hex(&record, RECORD_SIZE, &hash);
-    stable_sha256_hex(&record, &stable_hash);
-    print_hex("template: ", &record, RECORD_SIZE);
-    printf("template sha256: %s\n", &hash);
-    printf("template stable sha256: %s\n", &stable_hash);
-    print_time_fields("template time bytes", &record);
-    String why = time_validation_error(&record);
-    if (!str_eq(why, "ok")) printf("template time validation warning: %.*s\n", (int)why.len, why.ptr);
+    sha256_hex(record[..], &hash);
+    stable_sha256_hex(record[..], &stable_hash);
+    print_hex("template: ", record[..]);
+    io::printfn("template sha256: %s", &hash);
+    io::printfn("template stable sha256: %s", &stable_hash);
+    print_time_fields("template time bytes", record[..]);
+    String why = time_validation_error(record[..]);
+    if (!str_eq(why, "ok")) io::printfn("template time validation warning: %s", why);
 
-    if (opt.has_out_file) {
-        FilePtr f = fopen(opt.out_file.ptr, "wb");
-        if (f == null) {
-            perror(opt.out_file.ptr);
+    if (string_was_set(opt.out_file)) {
+        void? saved = file::save(opt.out_file, record[..]);
+        if (catch err = saved) {
+            io::printfn("Could not write %s: %s", opt.out_file, err);
             return 1;
         }
-        if (fwrite(&record, 1, RECORD_SIZE, f) != RECORD_SIZE) {
-            perror(opt.out_file.ptr);
-            fclose(f);
-            return 1;
-        }
-        fclose(f);
-        printf("wrote raw 48-byte template to %.*s\n", (int)opt.out_file.len, opt.out_file.ptr);
+        io::printfn("wrote raw 48-byte template to %s", opt.out_file);
     }
     return 0;
 }
 
 fn int run_update_time(Options* opt) {
     if (!opt.allow_hid_query) {
-        printf("Refusing update without --allow-hid-query\n");
+        io::printfn("Refusing update without --allow-hid-query");
         return 2;
     }
     if (!opt.allow_config_write) {
-        printf("Refusing update without --allow-config-write\n");
+        io::printfn("Refusing update without --allow-config-write");
         return 2;
     }
-    if (!opt.has_confirm_write || !str_eq(opt.confirm_write, WRITE_CONFIRM_TEXT)) {
-        printf("Refusing update without --confirm-write PATCH_ONLY_BYTES_35_41\n");
+    if (!string_was_set(opt.confirm_write) || !str_eq(opt.confirm_write, WRITE_CONFIRM_TEXT)) {
+        io::printfn("Refusing update without --confirm-write PATCH_ONLY_BYTES_35_41");
         return 2;
     }
-    if (!opt.has_expected_stable_sha256) {
-        printf("Refusing update without --expected-stable-sha256 from read-template\n");
+    if (!string_was_set(opt.expected_stable_sha256)) {
+        io::printfn("Refusing update without --expected-stable-sha256 from read-template");
         return 2;
     }
 
@@ -850,61 +777,59 @@ fn int run_update_time(Options* opt) {
     char[65] stable_hash_current;
     char[65] stable_hash_patched;
 
-    if (fill_time_bytes(opt.time_arg, &time_bytes) != 0) return 1;
+    if (fill_time_bytes(opt.time_arg, time_bytes[..]) != 0) return 1;
     if (transport_open(&transport, opt) != 0) return 1;
 
-    int rc = read_template_from_device(opt, &transport, &current);
+    int rc = read_template_from_device(opt, &transport, current[..]);
     if (rc == 0) {
-        sha256_hex(&current, RECORD_SIZE, &hash_current);
-        stable_sha256_hex(&current, &stable_hash_current);
-        if (opt.has_expected_template_sha256 && !hex_eq_ci(opt.expected_template_sha256, &hash_current)) {
-            printf("Refusing update: current template sha256 %s does not match expected %.*s\n",
+        sha256_hex(current[..], &hash_current);
+        stable_sha256_hex(current[..], &stable_hash_current);
+        if (string_was_set(opt.expected_template_sha256) && !hex_eq_ci(opt.expected_template_sha256, &hash_current)) {
+            io::printfn("Refusing update: current template sha256 %s does not match expected %s",
                 &hash_current,
-                (int)opt.expected_template_sha256.len,
-                opt.expected_template_sha256.ptr);
+                opt.expected_template_sha256);
             rc = -1;
         }
         if (!hex_eq_ci(opt.expected_stable_sha256, &stable_hash_current)) {
-            printf("Refusing update: stable template sha256 %s does not match expected %.*s\n",
+            io::printfn("Refusing update: stable template sha256 %s does not match expected %s",
                 &stable_hash_current,
-                (int)opt.expected_stable_sha256.len,
-                opt.expected_stable_sha256.ptr);
+                opt.expected_stable_sha256);
             rc = -1;
         }
     }
     if (rc == 0) {
-        String why = time_validation_error(&current);
+        String why = time_validation_error(current[..]);
         if (!str_eq(why, "ok")) {
-            printf("Refusing update: current record time fields look invalid: %.*s\n", (int)why.len, why.ptr);
+            io::printfn("Refusing update: current record time fields look invalid: %s", why);
             rc = -1;
         }
     }
     if (rc == 0) {
-        patch_time(&current, &time_bytes, &patched);
-        rc = verify_only_time_changed(&current, &patched);
+        patch_time(current[..], time_bytes[..], patched[..]);
+        rc = verify_only_time_changed(current[..], patched[..]);
     }
     if (rc == 0) {
-        sha256_hex(&patched, RECORD_SIZE, &hash_patched);
-        stable_sha256_hex(&patched, &stable_hash_patched);
-        printf("current template sha256: %s\n", &hash_current);
-        printf("patched  template sha256: %s\n", &hash_patched);
-        printf("current stable sha256: %s\n", &stable_hash_current);
-        printf("patched  stable sha256: %s\n", &stable_hash_patched);
-        print_time_fields("old time bytes", &current);
-        print_time_fields("new time bytes", &patched);
-        print_record_diff(&current, &patched);
-        rc = write_time_to_device(opt, &transport, &patched);
+        sha256_hex(patched[..], &hash_patched);
+        stable_sha256_hex(patched[..], &stable_hash_patched);
+        io::printfn("current template sha256: %s", &hash_current);
+        io::printfn("patched  template sha256: %s", &hash_patched);
+        io::printfn("current stable sha256: %s", &stable_hash_current);
+        io::printfn("patched  stable sha256: %s", &stable_hash_patched);
+        print_time_fields("old time bytes", current[..]);
+        print_time_fields("new time bytes", patched[..]);
+        print_record_diff(current[..], patched[..]);
+        rc = write_time_to_device(opt, &transport, patched[..]);
     }
 
     transport_close(&transport);
     if (rc != 0) return 1;
-    printf("Clock update command sequence completed.\n");
+    io::printfn("Clock update command sequence completed.");
     return 0;
 }
 
 fn int get_feature_report(Options* opt) {
     if (!opt.allow_hid_query) {
-        printf("Refusing HID feature read without --allow-hid-query\n");
+        io::printfn("Refusing HID feature read without --allow-hid-query");
         return 2;
     }
 
@@ -913,22 +838,22 @@ fn int get_feature_report(Options* opt) {
     usz report_len = REPORT_SIZE;
     if (transport_open(&transport, opt) != 0) return 1;
 
-    memset(&report, 0, REPORT_SIZE);
+    clear_bytes(report[..]);
     report[0] = opt.report_id;
     int rc = transport_get_feature_report(&transport, opt.report_id, &report, &report_len);
     transport_close(&transport);
     if (rc != 0) return 1;
-    print_hex("feature response: ", &report, report_len);
+    print_hex("feature response: ", report[0:report_len]);
     return 0;
 }
 
 fn int run_read_raw(Options* opt) {
     if (!opt.allow_hid_query) {
-        printf("Refusing raw HID read without --allow-hid-query\n");
+        io::printfn("Refusing raw HID read without --allow-hid-query");
         return 2;
     }
     if (opt.raw_command == 0) {
-        printf("read-raw needs --raw-command HEX\n");
+        io::printfn("read-raw needs --raw-command HEX");
         return 2;
     }
 
@@ -936,13 +861,13 @@ fn int run_read_raw(Options* opt) {
     char[REPORT_SIZE] packet;
     char[REPORT_SIZE] response;
     usz response_len = 0;
-    ushort offset = opt.raw_offset_set ? opt.raw_offset : slot_offset(opt.slot);
+    ushort offset = opt.raw_offset >= 0 ? (ushort)opt.raw_offset : slot_offset(opt.slot);
 
     if (transport_open(&transport, opt) != 0) return 1;
-    build_config_packet(opt.report_id, opt.raw_command, null, opt.raw_length, offset, &packet);
-    print_hex("raw read packet: ", &packet, REPORT_SIZE);
+    build_config_packet(opt.report_id, opt.raw_command, "", (usz)opt.raw_length, offset, packet[..]);
+    print_hex("raw read packet: ", packet[..]);
     int rc = transport_send_wait(&transport, &packet, opt.raw_command, opt.timeout_ms, &response, &response_len);
     transport_close(&transport);
-    if (response_len > 0) print_hex("raw read response: ", &response, response_len);
+    if (response_len > 0) print_hex("raw read response: ", response[0:response_len]);
     return rc == 0 ? 0 : 1;
 }

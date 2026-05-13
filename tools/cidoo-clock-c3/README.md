@@ -6,8 +6,10 @@ in its own project so the existing `.c` files are untouched.
 There is no C shim in this port. The transport boundary is C3-only:
 
 - `src/main.c3` owns CLI parsing, protocol packets, hashes, time encoding, and
-  update safety checks.
-- `src/c_api.c3` contains the generic libc/CommonCrypto extern declarations.
+  update safety checks. It uses the C3 standard library for console output,
+  file load/save, SHA-256, local time, monotonic timeouts, and memory copies.
+  Command-line option scanning is handled by the vendored `getopt.c3l`
+  `opt::@parse` macro.
 - `src/transport.c3` defines the generic `ClockTransport { kind, impl }` handle.
 - `src/macos_iokit_adapter.c3` is the macOS adapter. It contains the
   CoreFoundation/IOKit extern declarations and implements the transport API:
@@ -17,6 +19,10 @@ There is no C shim in this port. The transport boundary is C3-only:
 
 Another transport can keep `main.c3` unchanged by implementing the same
 transport API and changing the selected `TransportKind`/open path.
+
+The vendored `getopt.c3l` source lives in `vendor/getopt`, with its MIT license
+kept next to the source. The local copy preserves the caller's error-output
+setting across parser resets so `main.c3` can own CLI error messages.
 
 ## Build
 

@@ -42,6 +42,11 @@ stable sha256:   7feb12ff4d6aafc9e0d95fec4c2d4ab366275cfdbdee397545a84230d580cbf
 
 The stable hash masks clock bytes `35..41`, so it stays stable as time changes.
 
+Important limit: this is a backup of the 48-byte config/template record only.
+It is not a backup of the custom-image frame store. The image-store readback
+protocol has not been identified, so the original bucket image bytes are not
+backed up here.
+
 ## Clock Workflow
 
 Read the current 48-byte template:
@@ -82,6 +87,14 @@ hash:
   --expected-stable-sha256 PUT_CURRENT_STABLE_SHA256_HERE \
   --expected-template-sha256 b7f6a3ddbdf5412fe750612e445913a0a1ecfef875e9cbcbe82a8d6de3201e14 \
   --confirm-write RESTORE_48_BYTE_TEMPLATE
+```
+
+Use the current stable hash from a fresh `read-template`, not an old hash copied
+from this file. If the device currently matches the known-good stable hash, the
+value will be:
+
+```text
+7feb12ff4d6aafc9e0d95fec4c2d4ab366275cfdbdee397545a84230d580cbff
 ```
 
 ## Image Dry Runs
@@ -155,6 +168,128 @@ Windows-derived command `0x23` prepare timeout
 `0x23` times out after the report is sent, the uploader continues with command
 `0x21` packets because the Windows all-frame worker does the same.
 
+### Real Upload Preflight
+
+Before any real image upload:
+
+```sh
+make -C tools
+
+./tools/cidoo-clock read-template \
+  --allow-hid-query \
+  --slot 0 \
+  --out cidoo-template.bin
+
+./tools/cidoo-image dry-run-buckets \
+  --bucket1 path/to/gif1.gif \
+  --bucket2 path/to/gif2.gif \
+  --template-file cidoo-template.bin \
+  --orientation portrait \
+  --print-packets
+```
+
+Check the dry-run output before writing:
+
+- It ends with `No HID device was opened. No report was sent.`
+- `payload start byte offset` is `0`.
+- `cmd 0x23 image prepare timeout` is `total_frames * 300ms + 500ms`.
+- Changed config offsets are only `33`, `34`, `46`, plus clock bytes `35..41`
+  unless `--preserve-clock` is used.
+- `template stable sha256` is the hash to pass as
+  `--expected-stable-sha256` for the real upload.
+
+For two 8-frame GIFs, the expected total is 16 frames and the command `0x23`
+timeout is `5300 ms`.
+
+Real upload, after the preflight checks:
+
+```sh
+./tools/cidoo-image upload-buckets \
+  --bucket1 path/to/gif1.gif \
+  --bucket2 path/to/gif2.gif \
+  --orientation portrait \
+  --allow-hid-query \
+  --allow-config-write \
+  --allow-image-write \
+  --expected-stable-sha256 PUT_CURRENT_STABLE_SHA256_HERE \
+  --confirm-upload UPLOAD_SCREEN_IMAGE \
+  --print-packets
+```
+
+### GIF Conversion Notes
+
+OpenCV is not required for protocol reliability. The keyboard does not receive
+OpenCV data; it receives RGB565 frame bytes. The important protocol properties
+are the 48-byte metadata record, combined GIF1+GIF2 frame ordering, command
+`0x23`, and the command `0x21` RGB565 stream.
+
+The Windows app uses OpenCV `VideoCapture` for GIF/video import, so the only
+OpenCV-relevant risk is visual frame decoding. For suspicious GIFs, compare the
+payload hash from the original GIF with a coalesced copy:
+
+```sh
+magick input.gif -coalesce /private/tmp/cidoo-coalesced.gif
+
+./tools/cidoo-image dry-run-buckets \
+  --bucket1 input.gif \
+  --bucket2 input.gif \
+  --template-file cidoo-template.bin \
+  --orientation portrait
+
+./tools/cidoo-image dry-run-buckets \
+  --bucket1 /private/tmp/cidoo-coalesced.gif \
+  --bucket2 /private/tmp/cidoo-coalesced.gif \
+  --template-file cidoo-template.bin \
+  --orientation portrait
+```
+
+If the `payload sha256` values match, GIF coalescing is not changing what the
+uploader will send for that file. `~/Downloads/banana.gif` was checked this way:
+the original and an ImageMagick `-coalesce` copy produced the same payload hash.
+
+### Previous Failure Theory
+
+The earlier broken image uploads are most consistent with two protocol mistakes:
+
+- A partial/one-bucket upload is unsafe because command `0x23` appears to act on
+  the combined custom-image store, and the Windows sender always starts command
+  `0x21` at byte offset `0`.
+- The old uploader treated a command `0x23` timeout as fatal after the config
+  metadata had already been changed. That can leave the keyboard pointing at new
+  frame counts or buckets while no matching frame stream was programmed.
+
+The current uploader still requires both buckets and now follows the Windows
+worker by continuing to stream command `0x21` packets after command `0x23` is
+sent, even if command `0x23` does not produce a normal response.
+
+### Recovery Notes
+
+If the screen is wrong after an experiment, first read the current config record
+and use the stable hash printed by that read:
+
+```sh
+./tools/cidoo-clock read-template \
+  --allow-hid-query \
+  --slot 0 \
+  --out cidoo-template.bin
+```
+
+Then restore the known-good 48-byte config template:
+
+```sh
+./tools/cidoo-clock restore-template \
+  --allow-hid-query \
+  --allow-config-write \
+  --template-file backups/cidoo-template-known-good-restored-latest.bin \
+  --expected-stable-sha256 PUT_CURRENT_STABLE_SHA256_HERE \
+  --expected-template-sha256 b7f6a3ddbdf5412fe750612e445913a0a1ecfef875e9cbcbe82a8d6de3201e14 \
+  --confirm-write RESTORE_48_BYTE_TEMPLATE
+```
+
+This restores config metadata only. If the image store itself has been erased or
+partially programmed, the metadata restore may not bring back the original image
+bytes.
+
 ## Current Investigation Status
 
 Confirmed:
@@ -166,9 +301,12 @@ Confirmed:
 - Command `0x23` uses timeout `total_frames * 300ms + 500ms`.
 - Animation interval is stored globally at config offsets `43..44`; the default
   is `100` ms.
+- OpenCV is not part of the device protocol; it only affects host-side GIF/video
+  frame decoding before RGB565 conversion.
 
 Still unresolved:
 
 - The exact erase/prepare behavior behind command `0x23`.
 - Whether the keyboard firmware always replies to command `0x23`.
 - Exact OpenCV GIF compositing behavior for partial-frame GIFs.
+- Any protocol command for reading back the custom-image frame store.

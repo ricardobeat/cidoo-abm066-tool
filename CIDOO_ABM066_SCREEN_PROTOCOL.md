@@ -672,6 +672,17 @@ The command `0x21` sender does branch on per-packet transaction failures. If a
 `0x21` packet transaction fails, the sender returns that error to the async
 worker and the worker does not send the final command `0x02` image commit.
 
+The config metadata write and image-data write are separate protocol actions.
+The 48-byte config record stores selector/count/timing metadata, not image
+bytes. The custom-image frame bytes live in a separate image store written by
+command `0x21`.
+
+That means an interrupted all-frame operation can leave the keyboard with config
+metadata that points at frame counts or active buckets whose image bytes were not
+fully programmed. Restoring a 48-byte config record can restore metadata, but it
+does not reconstruct custom-image bytes that were erased or overwritten in the
+separate image store.
+
 ### Two-Bucket Semantics
 
 The official Windows all-frame operation treats the custom-image flash region as
