@@ -43,6 +43,8 @@
 #define DEFAULT_REPORT_ID 0x04
 #define UPLOAD_CONFIRM_TEXT "UPLOAD_SCREEN_IMAGE"
 #define IMAGE_UPLOAD_METADATA_IMPLEMENTED 0
+#define IMAGE_PREPARE_BASE_TIMEOUT_MS 500
+#define IMAGE_PREPARE_PER_FRAME_TIMEOUT_MS 300
 
 typedef enum {
     CMD_NONE,
@@ -610,6 +612,65 @@ static int send_report_wait(hid_session_t *session,
                                     true);
 }
 
+static int send_report_wait_ignoring_response_error(hid_session_t *session,
+                                                    const uint8_t packet[REPORT_SIZE],
+                                                    uint8_t expected_cmd,
+                                                    int timeout_ms,
+                                                    uint8_t response[REPORT_SIZE],
+                                                    size_t *response_len,
+                                                    const char *reason) {
+    session->expected_cmd = expected_cmd;
+    session->got_response = false;
+    session->response_len = 0;
+    memset(session->response, 0, sizeof(session->response));
+    memset(session->input_report, 0, sizeof(session->input_report));
+
+    const uint8_t *report_data = packet;
+    CFIndex report_len = REPORT_SIZE;
+    if (session->strip_report_id_for_iohid) {
+        report_data = packet + 1;
+        report_len = REPORT_SIZE - 1;
+    }
+
+    IOReturn rc = IOHIDDeviceSetReport(session->device,
+                                       kIOHIDReportTypeOutput,
+                                       session->report_id,
+                                       report_data,
+                                       report_len);
+    if (rc != kIOReturnSuccess) {
+        fprintf(stderr, "IOHIDDeviceSetReport cmd=0x%02x failed: 0x%08x\n",
+                expected_cmd,
+                rc);
+        return -1;
+    }
+
+    double deadline = monotonic_seconds() + (double)timeout_ms / 1000.0;
+    while (!session->got_response && monotonic_seconds() < deadline) {
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, true);
+    }
+    if (!session->got_response) {
+        fprintf(stderr,
+                "Timed out waiting for response to cmd=0x%02x; continuing because %s\n",
+                expected_cmd,
+                reason);
+        return 0;
+    }
+
+    if (response != NULL && response_len != NULL) {
+        memcpy(response, session->response, session->response_len);
+        *response_len = session->response_len;
+    }
+    if (session->response_len >= 8 &&
+        (session->response[7] == 0xff || session->response[7] == 0xfe)) {
+        fprintf(stderr,
+                "Device returned status 0x%02x for cmd=0x%02x; continuing because %s\n",
+                session->response[7],
+                expected_cmd,
+                reason);
+    }
+    return 0;
+}
+
 static bool looks_like_hex_text(const uint8_t *buf, size_t len) {
     for (size_t i = 0; i < len; i++) {
         unsigned char c = buf[i];
@@ -1173,6 +1234,17 @@ static size_t payload_packet_count(size_t payload_len) {
     return (payload_len + IMAGE_CHUNK_SIZE - 1) / IMAGE_CHUNK_SIZE;
 }
 
+static int image_prepare_timeout_ms(const options_t *opt,
+                                    const bucket_upload_plan_t *plan) {
+    size_t total_frames = plan->final_bucket1_frames + plan->final_bucket2_frames;
+    size_t windows_timeout = total_frames * IMAGE_PREPARE_PER_FRAME_TIMEOUT_MS +
+                             IMAGE_PREPARE_BASE_TIMEOUT_MS;
+    if (windows_timeout < (size_t)opt->timeout_ms) {
+        return opt->timeout_ms;
+    }
+    return (int)windows_timeout;
+}
+
 static void print_image_summary(const uint8_t payload[PADDED_IMAGE_SIZE],
                                 const options_t *opt) {
     char raw_hash[65];
@@ -1645,6 +1717,7 @@ static void print_bucket_image_summary(const options_t *opt,
     printf("final GIF2 frame count: %zu\n", plan->final_bucket2_frames);
     printf("final total frame count: %zu\n",
            plan->final_bucket1_frames + plan->final_bucket2_frames);
+    printf("cmd 0x23 image prepare timeout: %d ms\n", image_prepare_timeout_ms(opt, plan));
     printf("payload start frame: %zu\n", (size_t)plan->payload_offset / PADDED_IMAGE_SIZE);
     printf("payload start byte offset: %u\n", plan->payload_offset);
     printf("payload bytes sent: %zu\n", plan->payload_len);
@@ -1697,9 +1770,18 @@ static int write_bucket_images_to_device(const options_t *opt,
     uint8_t response[REPORT_SIZE];
     size_t response_len = 0;
     size_t packet_count = payload_packet_count(plan->payload_len);
+    int prepare_timeout_ms = image_prepare_timeout_ms(opt, plan);
 
     build_simple_packet(opt->report_id, 0x23, packet);
-    if (send_report_wait(session, packet, 0x23, opt->timeout_ms, response, &response_len) != 0) {
+    printf("waiting up to %d ms for cmd 0x23 image prepare\n", prepare_timeout_ms);
+    if (send_report_wait_ignoring_response_error(
+            session,
+            packet,
+            0x23,
+            prepare_timeout_ms,
+            response,
+            &response_len,
+            "the Windows all-frame worker does not branch on the cmd 0x23 result") != 0) {
         return -1;
     }
 

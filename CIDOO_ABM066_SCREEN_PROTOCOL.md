@@ -240,6 +240,12 @@ ceil(65536 / 56) = 1171 packets
 The app waits about 500 ms after the first successful `0x21` packet whose offset
 is zero.
 
+In the all-frame sender at `0x481850`, the payload offset is a local loop
+counter initialized to zero and incremented by the sent chunk length. No caller
+argument supplies a nonzero start offset. For the Windows two-bucket path, image
+data therefore always starts at byte offset `0` of the combined custom-image
+store.
+
 Example first image packet for an all-black image:
 
 ```text
@@ -458,8 +464,8 @@ The official app then overwrites these byte offsets before sending:
 | `39` | day of month, packed BCD |
 | `40` | month, packed BCD, January `0x01` through December `0x12` |
 | `41` | two-digit year, packed BCD |
-| `43` | low byte of a 16-bit UI/config value |
-| `44` | high byte of a 16-bit UI/config value |
+| `43` | `FrameIntervalTime` low byte, little-endian milliseconds |
+| `44` | `FrameIntervalTime` high byte, little-endian milliseconds |
 
 All other offsets are preserved from the 48-byte template:
 
@@ -489,195 +495,40 @@ payload[40] = 0x05  month
 payload[41] = 0x26  year
 ```
 
-### Safe Time Update Strategy
+### Frame Interval Encoding
 
-To minimize brick risk, do not reconstruct the 48-byte record from app UI state
-or constants.
+The bundled `app/DefaultData/Keyboard.json` contains:
 
-The safest inferred strategy is:
+```json
+"FrameIntervalTime":100
+```
 
-1. Obtain the current 48-byte record for the exact slot that will be written.
-2. Verify the read returned exactly 48 bytes and that the existing time fields
-   at offsets `35..41` decode to plausible BCD/date values.
-3. Create the write payload by copying all 48 bytes unchanged.
-4. Replace only offsets `35..41` with the new local time/date values.
-5. Refuse to write if any other byte differs from the current record.
-6. Use command `0x06` at the same slot offset, with the standard outer checksum.
-
-This avoids the official app's broader rewrite of mode/color/layout fields while
-still updating the clock bytes the app itself uses.
-
-Important caveat: on this protocol even a read operation requires sending a HID
-output report containing command `0x05`. That is a non-mutating query, but it is
-still a USB/HID write at the transport layer. Only these read-query output
-reports were sent during the live investigation.
-
-## Clock Update Tool
-
-The repo contains a macOS C helper at:
+The known-good 48-byte device template stores bytes `43..44` as:
 
 ```text
-tools/cidoo-clock.c
+64 00
 ```
 
-Build it with:
+That is little-endian decimal `100`. Static analysis of `0x49f5c0` confirms
+those two payload bytes are written from object field `0x2848`.
 
-```sh
-make -C tools
-```
+The protocol stream carries frame count metadata, not per-frame timing metadata.
+The current evidence points to one global frame interval in the config record,
+not individual GIF frame delays.
 
-The tool is intentionally gated:
+### Config Mutation Boundaries
 
-- `dry-run` never opens HID and never sends a report.
-- `read-template` refuses to send command `0x05` unless `--allow-hid-query` is
-  present.
-- `update-time` refuses to write unless all three guards are present:
-  `--allow-hid-query`, `--allow-config-write`, and
-  `--confirm-write PATCH_ONLY_BYTES_35_41`.
-- `update-time` also requires `--expected-stable-sha256`. This hash is computed
-  from the 48-byte record with offsets `35..41` zeroed, so it stays stable even
-  if the device clock seconds change between `read-template` and `update-time`.
-- The clock tool defaults to usage page `0xff1c`, usage `0x92`, and report ID
-  `0x04`, matching the Windows app's config protocol.
-- `read-template` uses the official `0x482300` 4-byte chunked read helper, so it
-  works with the 8-byte input report exposed by macOS.
-- The tool also rejects exact 64-byte echoes and all-zero 48-byte payloads, so
-  the report ID `0x05` echo path cannot accidentally create a fake template.
+The official config writer reconstructs many UI-derived bytes before sending
+command `0x06`. The clock-only update boundary inferred from the data format is
+to preserve the current 48-byte record and replace only offsets `35..41`.
 
-Recommended workflow:
+The custom image metadata boundary inferred from the all-frame path is to
+preserve the current 48-byte record and replace offsets `33`, `34`, and `46`;
+Windows also refreshes clock offsets `35..41` when it writes this record.
 
-```sh
-# Sends only non-mutating 0x05 query reports and saves the active slot template.
-./tools/cidoo-clock read-template --allow-hid-query --slot 0 --out template.bin
-
-# No device access. Verifies the saved 48-byte template and prints the exact
-# command 0x06 packet that would be sent.
-./tools/cidoo-clock dry-run --template-file template.bin --print-packets
-
-# Writes only after re-reading the current 48-byte record, checking the stable
-# hash from read-template, patching only bytes 35..41, and verifying that no
-# other payload byte changed.
-./tools/cidoo-clock update-time \
-  --allow-hid-query \
-  --allow-config-write \
-  --expected-stable-sha256 PUT_HASH_FROM_READ_TEMPLATE_HERE \
-  --confirm-write PATCH_ONLY_BYTES_35_41
-```
-
-Current safety conclusion: slot `0` can be read as a real 48-byte template on
-macOS using the chunked read helper. Slots `1` and `2` should not be used for a
-time update based on the current evidence. The all-zero records produced through
-report ID `0x05` are rejected and must not be used as write templates.
-
-For numbered reports on macOS, the tool passes the full documented 64-byte
-packet to `IOHIDDeviceSetReport` while also specifying report ID `0x04`. The
-diagnostic option `--strip-report-id-for-iohid` is available for experiments,
-but it is not the default because many macOS HID paths expect the report ID byte
-to remain in the buffer.
-
-## Safety Notes
-
-Do not send HID output or feature reports to the keyboard unless deliberately
-testing with user approval.
-
-For a macOS implementation, start with a dry-run mode that:
-
-1. Parses an image or screen JSON into `240 x 135` RGB pixels.
-2. Converts to padded RGB565 payload.
-3. Builds command `0x01`, `0x21`, and `0x02` packets.
-4. Prints packet counts, checksums, and first/last packets without opening HID.
-
-Only after dry-run verification should a real HID write mode be enabled.
-
-## Image Upload Tool
-
-The repo also contains a macOS C helper for screen image uploads:
-
-```text
-tools/cidoo-image.c
-```
-
-Build it with:
-
-```sh
-make -C tools
-```
-
-The tool loads a host image through macOS ImageIO, fits it to a logical display
-canvas, rotates that canvas into the protocol framebuffer when needed, converts
-RGB888 to big-endian RGB565, pads the payload to `65536` bytes, and builds the
-confirmed command sequence:
-
-```text
-0x01 begin
-0x21 image chunks, 56 bytes per packet
-0x02 commit
-```
-
-It is intentionally gated:
-
-- `dry-run` never opens HID and never sends a report.
-- `upload` refuses to send any report unless both guards are present:
-  `--allow-image-write` and `--confirm-upload UPLOAD_SCREEN_IMAGE`.
-- The default HID target is usage page `0xff1c`, usage `0x92`, report ID `0x04`.
-- `--orientation landscape` uses a `240 x 135` physical preview and no rotation.
-- `--orientation portrait` uses a `135 x 240` physical preview and rotates it
-  into the required `240 x 135` framebuffer. The default portrait rotation is
-  `90`; use `--rotate 270` if the first test appears upside down or sideways on
-  the device.
-
-Recommended portrait dry-run:
-
-```sh
-./tools/cidoo-image dry-run \
-  --image path/to/image.png \
-  --orientation portrait \
-  --fit cover \
-  --preview-out /private/tmp/cidoo-physical-preview.png \
-  --framebuffer-preview-out /private/tmp/cidoo-framebuffer-preview.png \
-  --print-packets
-```
-
-Expected ABM066 image payload properties:
-
-```text
-physical preview: 135x240
-rotation into framebuffer: 90
-framebuffer: 240x135
-rgb565 bytes: 64800
-padded bytes: 65536
-chunk bytes: 56
-image packet count: 1171
-```
-
-The dry-run should end with:
-
-```text
-No HID device was opened. No report was sent.
-```
-
-The physical preview PNG is what should appear upright on the device. The
-framebuffer preview PNG is the rotated `240 x 135` raster that is actually
-encoded into RGB565.
-
-Important current limitation: the legacy `upload --image` command only models
-the raw one-frame stream and is intentionally blocked for real writes. Use the
-two-bucket commands below for hardware uploads, because they update the
-48-byte config metadata and image payload together.
-
-Upload command, only after inspecting dry-run output:
-
-```sh
-./tools/cidoo-image upload \
-  --image path/to/image.png \
-  --orientation portrait \
-  --fit cover \
-  --preview-out /private/tmp/cidoo-physical-preview.png \
-  --framebuffer-preview-out /private/tmp/cidoo-framebuffer-preview.png \
-  --allow-image-write \
-  --confirm-upload UPLOAD_SCREEN_IMAGE \
-  --print-packets
-```
+On this protocol even a read operation requires sending a HID output report
+containing command `0x05`. That is a non-mutating query at the protocol level,
+but it is still a USB/HID write at the transport layer.
 
 ## Multi-Frame / Two Custom Screen Images
 
@@ -693,6 +544,37 @@ The UI resources define both buckets even in the default data:
 
 Each frame-list JSON contains a `Frame` array whose entries name per-frame pixel
 JSON files. A still image is represented as a one-frame animation.
+
+### Windows Image/GIF Import Path
+
+The Windows app imports still images and animated/video sources through OpenCV
+3.2 (`opencv_world320.dll`).
+
+Still-image import:
+
+- Function path beginning near `0x4afd4e`
+- Calls `cv::imread(path, 1)`, i.e. color image import
+- Optionally calls `cv::transpose` and `cv::flip` when object field `0x28bc` is
+  set
+- Calls `cv::resize` to the screen dimensions when the imported image size does
+  not already match object fields `0x28b4` and `0x28b8`
+- Adds the resulting frame to the screen-frame list
+
+Animated/video import, including GIFs:
+
+- Function path beginning near `0x4b0550`
+- Constructs `cv::VideoCapture`
+- Calls `VideoCapture::open(path)`
+- Checks `VideoCapture::isOpened()`
+- Repeatedly calls `VideoCapture::read(Mat)` until it fails
+- Caps the stored frame count to object field `0x28ac`
+- Runs every decoded `Mat` through function `0x4b02b0`, which uses the same
+  optional transpose/flip and resize pipeline as still images
+
+This means the official GIF path is a video-frame decode path before frames are
+converted into the app's screen-frame/pixel representation. GIF files with
+subrectangle frames or disposal rules depend on OpenCV's video decoder behavior
+before reaching the CIDOO protocol layer.
 
 ### Windows "Upload All Frames" Path
 
@@ -764,82 +646,52 @@ The Windows code path is:
 Command `0x23` has the same zero-payload packet shape as the simple begin
 commands, but command byte `3` is `0x23`.
 
-### Safe Multi-Image Strategy
+Before command `0x23`, the app calls function `0x482ca0(total_frames)`, which
+stores the combined frame count at protocol object offset `0x658`. Command
+`0x23` then uses the variant transaction wrapper at `0x47dbd0`.
 
-To safely store two still images for later toggling as `Custom1` / `Custom2`,
-the uploader should not synthesize config bytes from constants. It should:
-
-1. Read the current active 48-byte config template with the same chunked
-   command `0x05` path used by `cidoo-clock`.
-2. Build one padded frame for each still image.
-3. Concatenate frames in official order: all `GIF1` frames, then all `GIF2`
-   frames.
-4. Copy the 48-byte template unchanged.
-5. Patch only the image metadata bytes needed for the chosen layout:
-   `33`, `34`, and `46`. If matching Windows exactly, also patch clock bytes
-   `35..41` to the current local time because the official config writer does.
-6. Dry-run must print the before/after config diff and refuse unless the only
-   config changes are the expected offsets.
-7. Only then send the command sequence above.
-
-This path is implemented in `tools/cidoo-image.c` as `dry-run-buckets` and
-`upload-buckets`. The legacy single-image `upload` command still refuses to
-write.
-
-The dry-run command can inspect either one bucket or both buckets, but real
-uploads must write both buckets together.
-
-- `--bucket1 PATH --bucket2 PATH`: writes the full Windows-style combined stream
-  from frame offset `0`.
-- Partial upload attempts are disabled. A failed `GIF2`-only test strongly
-  indicates that command `0x23` operates on, erases, or reinitializes the
-  combined custom-image store rather than safely preserving the untouched
-  bucket. This matches the Windows app behavior: it uploads all frames from
-  `GIF1` followed by all frames from `GIF2`.
-
-Dry-run with a freshly read 48-byte template:
-
-```sh
-./tools/cidoo-clock read-template \
-  --allow-hid-query \
-  --out cidoo-template.bin
-
-./tools/cidoo-image dry-run-buckets \
-  --bucket1 path/to/gif1.gif \
-  --bucket2 path/to/gif2.gif \
-  --template-file cidoo-template.bin \
-  --orientation portrait \
-  --print-packets
-```
-
-For the Windows-equivalent behavior, omit `--preserve-clock`; the tool refreshes
-clock bytes `35..41` the same way the Windows config writer does. With
-`--preserve-clock`, the dry-run must show only offsets `33`, `34`, and `46`
-changed.
-
-Real upload requires all gates:
-
-```sh
-./tools/cidoo-image upload-buckets \
-  --bucket1 path/to/gif1.gif \
-  --bucket2 path/to/gif2.gif \
-  --orientation portrait \
-  --allow-hid-query \
-  --allow-config-write \
-  --allow-image-write \
-  --expected-stable-sha256 TEMPLATE_STABLE_SHA256_FROM_DRY_RUN_OR_READ_TEMPLATE \
-  --confirm-upload UPLOAD_SCREEN_IMAGE \
-  --print-packets
-```
-
-The uploader refuses all-zero templates, re-reads the current config record
-before writing, verifies the current stable hash, verifies that only expected
-config offsets changed, then sends:
+That wrapper computes its response timeout from the stored frame count:
 
 ```text
-0x01, 0x06, 0x02, 0x23, repeated 0x21, 0x02
+timeout_ms = total_frames * 0x12c + 0x1f4
+timeout_ms = total_frames * 300 + 500
 ```
 
-The tool currently caps input at 64 frames per bucket by default, accepts
-`--max-frames-per-bucket` up to 255, and refuses more than 255 total frames so
-the 24-bit image-packet offset stays inside the understood range.
+Examples:
+
+```text
+16 total frames -> 5300 ms
+28 total frames -> 8900 ms
+```
+
+The async worker at `0x474f4a` calls `0x481640` for command `0x23`, then calls
+`0x481850` to stream command `0x21` packets. It does not branch on the return
+value from command `0x23`.
+
+The command `0x21` sender does branch on per-packet transaction failures. If a
+`0x21` packet transaction fails, the sender returns that error to the async
+worker and the worker does not send the final command `0x02` image commit.
+
+### Two-Bucket Semantics
+
+The official Windows all-frame operation treats the custom-image flash region as
+one combined store:
+
+```text
+GIF1 frames first, then GIF2 frames
+command 0x21 byte offset starts at 0
+```
+
+There is no confirmed protocol field for "start writing at GIF2". The sender's
+offset counter starts at zero, and command `0x23` appears to prepare or
+reinitialize the combined store before data packets are sent.
+
+Current unresolved details:
+
+- Whether command `0x23` erases the full combined custom-image store or only
+  starts a flash/programming mode.
+- Whether command `0x23` needs to return a response on every firmware version,
+  since the Windows async worker sends command `0x21` data even when command
+  `0x23` reports an error to its caller.
+- The exact OpenCV backend behavior for GIF subrectangle/disposal compositing on
+  the bundled Windows runtime.
