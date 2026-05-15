@@ -16,14 +16,13 @@ make -C tools
 - Dry-run commands do not open HID and do not send reports.
 - Template reads send command `0x05`; this is a non-mutating protocol query, but
   it is still a USB/HID output report.
-- Config writes require explicit write flags and a confirmation string.
-- Image writes require explicit write flags and `--confirm-upload
-  UPLOAD_SCREEN_IMAGE`.
-- Bucket image uploads are still experimental. The current implementation
-  matches the Windows-app command order and the Windows-derived command `0x23`
-  timeout. After command `0x23` is sent, a response timeout/status does not stop
-  the image stream, matching the Windows worker. There is not yet a confirmed
-  successful real image upload.
+- Clock/config tools still use their own safety flags.
+- `cidoo-image upload-buckets` no longer requires write confirmation flags; use
+  `dry-run-buckets` first when changing inputs.
+- Bucket image uploads are confirmed on ABM066 with the `lcd160x96` encoder.
+  After command `0x23` is sent, a response timeout/status does not stop the
+  image stream, matching the Windows worker. `--debug` prints packet dumps,
+  hashes, config diffs, and command-level timing details.
 
 ## Known-Good Template Backup
 
@@ -104,11 +103,9 @@ Portrait single-image packet dry-run:
 ```sh
 ./tools/cidoo-image dry-run \
   --image path/to/image.png \
-  --orientation portrait \
-  --fit cover \
   --preview-out /private/tmp/cidoo-physical-preview.png \
   --framebuffer-preview-out /private/tmp/cidoo-framebuffer-preview.png \
-  --print-packets
+  --debug
 ```
 
 Two-bucket dry-run with a freshly read template:
@@ -118,20 +115,25 @@ Two-bucket dry-run with a freshly read template:
   --bucket1 path/to/gif1.gif \
   --bucket2 path/to/gif2.gif \
   --template-file cidoo-template.bin \
-  --orientation portrait \
-  --print-packets
+  --debug
 ```
 
 Expected ABM066 payload properties:
 
 ```text
-physical preview: 135x240
-rotation into framebuffer: 90
-framebuffer: 240x135
-rgb565 bytes per frame: 64800
-padded bytes per frame: 65536
-chunk bytes: 56
-image packet count per frame: 1171
+physical preview: 96x160
+rotation into framebuffer: not used
+active selector byte after upload: 0
+clock bytes: refreshed to local time
+device layout: lcd160x96
+device logical frame: 160x96
+device bytes per frame: 32768
+chunk bytes: 24
+final GIF1 frame count: 1
+final GIF2 frame count: 1
+final total frame count: 2
+payload bytes sent: 65536
+image packet count: 2731
 ```
 
 ## Image Uploads
@@ -142,31 +144,51 @@ offset `0` and command `0x23` appears to prepare that whole store.
 
 GIF support is still the riskiest host-side conversion difference. The Windows
 app imports GIFs through OpenCV `VideoCapture`, then resizes/rotates each decoded
-video frame. This tool currently decodes frames with macOS ImageIO. Inspect the
-bucket previews before any real GIF upload, especially for GIFs whose frames are
-subrectangles rather than full-canvas frames.
+video frame. That resize is stretch-to-fit, not aspect-preserving letterbox or
+cover. Community ABM066 notes identify the screen as `96x160`, a `3:5` portrait
+ratio. The tool now defaults to a native `96x160` source canvas, rotates it into
+`160x96` RGB565 device memory, and pads each frame to the `0x8000` byte frame
+stride. GIFs are
+automatically coalesced to full PNG frames with ImageMagick before encoding so
+partial GIF frame rectangles are not treated as complete frames. Inspect the
+bucket previews before any real GIF upload.
 
 Current upload command shape:
 
 ```sh
 ./tools/cidoo-image upload-buckets \
   --bucket1 path/to/gif1.gif \
-  --bucket2 path/to/gif2.gif \
-  --orientation portrait \
-  --allow-hid-query \
-  --allow-config-write \
-  --allow-image-write \
-  --expected-stable-sha256 PUT_CURRENT_STABLE_SHA256_HERE \
-  --confirm-upload UPLOAD_SCREEN_IMAGE \
-  --print-packets
+  --bucket2 path/to/gif2.gif
 ```
 
-The bucket uploader re-reads the current config record, verifies the current
-stable hash, verifies that only expected config offsets changed, uses the
-Windows-derived command `0x23` prepare timeout
-`total_frames * 300ms + 500ms`, then sends the combined frame stream. If command
-`0x23` times out after the report is sent, the uploader continues with command
-`0x21` packets because the Windows all-frame worker does the same.
+The bucket uploader re-reads the current config record immediately before
+writing, preserves the current selector byte at offset `33` by default,
+verifies that only expected config offsets changed, writes the 48-byte config,
+then reads the config back and checks the stable hash before any image data is
+sent. With `--debug`, it also prints hashes, config diffs, HID packets, and the
+Windows-derived command `0x23` prepare timeout formula. The local uploader waits
+only the normal HID timeout for a response; if `0x23` does not respond, it still
+waits the remaining Windows-derived prepare time before streaming command `0x21`
+packets. Starting `0x21` immediately after a `0x23` timeout can make the first
+image packet time out while the keyboard is still preparing/erasing the image
+store.
+
+Command `0x21` image data now defaults to the Windows constructor's `24` byte
+chunk mode. Static analysis also found a `56` byte mode, but live ABM066 tests
+with `56` byte image chunks produced regularly cut/interlaced output.
+
+Live mapping tests showed that the device indexes custom image frames at
+`32768` byte boundaries, not at the host-side `65536` byte padded frame boundary
+from the Windows all-frame buffer. The uploader now places bucket frames on
+`32768` byte boundaries by default. The current encoder writes the `96x160`
+physical source as `160x96` RGB565 memory (`30720` bytes), followed by `2048`
+padding bytes. Writing the `96x160` source row-major produced source top/bottom
+halves on opposite screen sides and spread corner markers through the height,
+which is consistent with the device reading landscape memory and rotating it
+onto the portrait LCD.
+
+`--expected-stable-sha256 HEX` is still available as an optional extra guard,
+but normal uploads do not need it.
 
 ### Real Upload Preflight
 
@@ -184,36 +206,35 @@ make -C tools
   --bucket1 path/to/gif1.gif \
   --bucket2 path/to/gif2.gif \
   --template-file cidoo-template.bin \
-  --orientation portrait \
-  --print-packets
+  --debug
 ```
 
 Check the dry-run output before writing:
 
 - It ends with `No HID device was opened. No report was sent.`
 - `payload start byte offset` is `0`.
-- `cmd 0x23 image prepare timeout` is `total_frames * 300ms + 500ms`.
-- Changed config offsets are only `33`, `34`, `46`, plus clock bytes `35..41`
-  unless `--preserve-clock` is used.
-- `template stable sha256` is the hash to pass as
-  `--expected-stable-sha256` for the real upload.
+- `cmd 0x23 image prepare frame basis` is the larger of the current and final
+  total frame counts.
+- `cmd 0x23 Windows prepare timeout formula` is `frame_basis * 300ms + 500ms`;
+  the actual response wait, `cmd 0x23 local prepare wait`, defaults to
+  `1500 ms`. If no response arrives, the uploader sleeps the remaining Windows
+  formula time before the first `0x21` image packet.
+- `active selector byte after upload` preserves the current template value; on
+  the known-good restored template this is `0`.
+- Changed config offsets are only `34`, `46`, plus clock bytes `35..41` unless
+  `--preserve-clock` is used. Offset `33` should only change if using the
+  diagnostic `--active-bucket` override.
 
-For two 8-frame GIFs, the expected total is 16 frames and the command `0x23`
-timeout is `5300 ms`.
+For two 8-frame GIFs against the known-good `20 + 8` template, the final total
+is 16 frames and the prepare basis is 28 frames. The Windows formula would be
+`8900 ms`, but the local `0x23` wait remains the normal HID timeout.
 
 Real upload, after the preflight checks:
 
 ```sh
 ./tools/cidoo-image upload-buckets \
   --bucket1 path/to/gif1.gif \
-  --bucket2 path/to/gif2.gif \
-  --orientation portrait \
-  --allow-hid-query \
-  --allow-config-write \
-  --allow-image-write \
-  --expected-stable-sha256 PUT_CURRENT_STABLE_SHA256_HERE \
-  --confirm-upload UPLOAD_SCREEN_IMAGE \
-  --print-packets
+  --bucket2 path/to/gif2.gif
 ```
 
 ### GIF Conversion Notes
@@ -224,28 +245,44 @@ are the 48-byte metadata record, combined GIF1+GIF2 frame ordering, command
 `0x23`, and the command `0x21` RGB565 stream.
 
 The Windows app uses OpenCV `VideoCapture` for GIF/video import, so the only
-OpenCV-relevant risk is visual frame decoding. For suspicious GIFs, compare the
-payload hash from the original GIF with a coalesced copy:
+OpenCV-relevant risk is visual frame decoding. The uploader uses ImageMagick's
+`magick input.gif -coalesce PNG32:...` path for GIFs. If `magick` is unavailable,
+GIF uploads fail before any HID write is sent.
+
+If a GIF looks garbled on-device but a recognizable outline is visible, test one
+still frame in both buckets before changing more protocol code. This separates
+scan/transport problems from animation tearing or GIF-frame compositing:
 
 ```sh
-magick input.gif -coalesce /private/tmp/cidoo-coalesced.gif
+magick input.gif -coalesce -delete 1--1 PNG32:/private/tmp/cidoo-first-frame.png
 
-./tools/cidoo-image dry-run-buckets \
-  --bucket1 input.gif \
-  --bucket2 input.gif \
-  --template-file cidoo-template.bin \
-  --orientation portrait
-
-./tools/cidoo-image dry-run-buckets \
-  --bucket1 /private/tmp/cidoo-coalesced.gif \
-  --bucket2 /private/tmp/cidoo-coalesced.gif \
-  --template-file cidoo-template.bin \
-  --orientation portrait
+./tools/cidoo-image upload-buckets \
+  --bucket1 /private/tmp/cidoo-first-frame.png \
+  --bucket2 /private/tmp/cidoo-first-frame.png
 ```
 
-If the `payload sha256` values match, GIF coalescing is not changing what the
-uploader will send for that file. `~/Downloads/banana.gif` was checked this way:
-the original and an ImageMagick `-coalesce` copy produced the same payload hash.
+A clean still image means RGB565 encoding, packet order, and the basic image
+store write are probably correct; the remaining issue is multi-frame layout or
+animation timing/compositing. A garbled still image means the bug is lower-level
+than GIF animation.
+
+For row/column scan diagnostics, use one-frame stripe images in the two buckets:
+
+```sh
+magick -size 96x160 xc:white -fx 'mod(j,2)' /private/tmp/cidoo-row-stripes.png
+magick -size 96x160 xc:white -fx 'mod(i,2)' /private/tmp/cidoo-column-stripes.png
+
+./tools/cidoo-image upload-buckets \
+  --bucket1 /private/tmp/cidoo-row-stripes.png \
+  --bucket2 /private/tmp/cidoo-column-stripes.png
+```
+
+Bucket 1 should show horizontal one-pixel stripes; bucket 2 should show vertical
+one-pixel stripes. If those are clean, the host payload order is not the source
+of the banana artifact. If both custom views show horizontal stripes, or if the
+same image appears split between left and right halves, first check that the
+upload printed `active selector byte after upload: 0` and that changed config
+offsets did not include `33`.
 
 ### Previous Failure Theory
 
@@ -257,6 +294,9 @@ The earlier broken image uploads are most consistent with two protocol mistakes:
 - The old uploader treated a command `0x23` timeout as fatal after the config
   metadata had already been changed. That can leave the keyboard pointing at new
   frame counts or buckets while no matching frame stream was programmed.
+- An older uploader also forced config offset `33` to `1`. The known-good
+  restored template has offset `33 = 0`, and forcing it away from `0` correlated
+  with split/striped custom-image output during live tests.
 
 The current uploader still requires both buckets and now follows the Windows
 worker by continuing to stream command `0x21` packets after command `0x23` is
@@ -295,14 +335,32 @@ bytes.
 Confirmed:
 
 - Config writes patch a 48-byte template; image bucket metadata is offsets
-  `33`, `34`, and `46`.
+  `33`, `34`, and `46`. The current uploader preserves offset `33` by default
+  because the exact selector semantics are not fully resolved and the known-good
+  ABM066 template uses `0`.
 - GIF1 and GIF2 share one combined custom-image store: GIF1 frames first, GIF2
   frames second, command `0x21` byte offset starts at `0`.
-- Command `0x23` uses timeout `total_frames * 300ms + 500ms`.
+- Both confirmed Windows packers write their source `240x135` frames in ordinary
+  row-major order: `payload[(y * width + x) * 2]`. No odd/even row interleave,
+  column-major order, or serpentine scan mapping has been found in the Windows
+  host-side frame builder.
+- Live ABM066 custom-view tests indicate the display consumes `32768` byte
+  device frames, not the Windows host-side `65536` byte frame stride. Community
+  notes identify the actual screen resolution as `96x160`. The current candidate
+  is a `96x160` source rotated into `160x96` memory:
+  `160 * 96 * 2 = 30720` bytes plus `2048` bytes of frame padding. The previous
+  `96x160` row-major, `135x120`, and `128x128` candidates produced
+  staircase/interleave artifacts or had the wrong aspect ratio.
+- The Windows command `0x23` wrapper uses timeout `total_frames * 300ms + 500ms`.
+  The local uploader waits only the normal HID timeout for a response, then
+  sleeps the remaining Windows-derived prepare time if no response arrived,
+  because the first `0x21` packet can time out while the device is still
+  preparing/erasing the image store.
 - Animation interval is stored globally at config offsets `43..44`; the default
-  is `100` ms.
-- OpenCV is not part of the device protocol; it only affects host-side GIF/video
-  frame decoding before RGB565 conversion.
+  template value is `100` ms. Community notes recommend exporting GIFs at
+  `96x160`, `16` fps and setting the interval to `60` ms for smooth playback.
+- OpenCV is not part of the device protocol; it affects host-side GIF/video
+  frame decoding and stretch-to-fit resizing before RGB565 conversion.
 
 Still unresolved:
 

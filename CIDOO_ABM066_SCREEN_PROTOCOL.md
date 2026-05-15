@@ -104,6 +104,16 @@ structure at object offset `0x3df28`, with width at `0x28b4` and height at
 240 * 8 = 0x780
 ```
 
+The Windows UI drawing area is `480 x 270`, exactly `2x` the `240 x 135`
+logical framebuffer. Live ABM066 testing showed that an unrotated `240 x 135`
+payload displays sideways on the physical screen, so host-side portrait
+pre-rotation is required for this device.
+
+The Windows imported-image rotate path is gated by object field `0x28bc`. When
+enabled, function `0x4b02b0` calls OpenCV `transpose`, then `flip(..., 0)`, then
+resizes to object fields `0x28b4 x 0x28b8`. That transform is equivalent to a
+`270` degree rotation in the local uploader's convention.
+
 ## Upload Pixel Encoding
 
 The confirmed image upload path converts RGB888 to RGB565:
@@ -131,6 +141,43 @@ the upload buffer becomes:
 ```text
 65536 bytes
 ```
+
+Both confirmed Windows packers use ordinary row-major pixel order:
+
+```text
+pixel_index = y * width + x
+payload_offset = pixel_index * 2
+```
+
+No odd/even row interleave, column-major order, or serpentine scan mapping has
+been found in the Windows upload path.
+
+Live ABM066 tests show an additional device-side layout for the visible custom
+views. The firmware appears to display `32768` byte device frames. Community
+notes identify the actual screen resolution as `96x160`; live artifacts indicate
+the device reads a landscape `160x96` memory frame and rotates it onto the
+portrait LCD. The current working layout candidate is:
+
+```text
+physical source       = 96 x 160 pixels
+device memory frame   = 160 x 96 pixels
+row stride            = 320 bytes
+pixel bytes           = 160 * 96 * 2 = 30720 bytes
+device frame stride   = 32768 bytes
+trailing padding      = 2048 bytes
+```
+
+Earlier `135x120` tests produced staircase artifacts. Changing that candidate
+from tight `270` byte rows to `272` byte rows made the red/green boundary
+interleave worse. A `128x128` candidate matched the `0x8000` byte frame size but
+does not match the reported `3:5` physical screen ratio. Writing a native
+`96x160` source directly in portrait row-major order put source top/bottom
+halves on opposite sides of the display and spread corner markers through the
+height, matching a landscape-memory interpretation.
+
+This is distinct from the Windows host-side all-frame buffer, which still uses
+`240x135` source frames padded to `65536` bytes before handing the buffer to the
+upload worker.
 
 ## HID Packet Format
 
@@ -225,20 +272,30 @@ byte 7 = payload offset high byte
 byte 8..63 = payload chunk
 ```
 
-The observed configured chunk size for the ABM066 path is `0x38` bytes:
+The Windows sender stores its command `0x21` chunk length in the protocol object.
+Static analysis found two configured modes:
 
 ```text
+0x18 = 24 bytes
 0x38 = 56 bytes
 ```
 
-For the padded `65536` byte RGB565 payload, this means:
+The protocol object constructor initializes the value to `0x18`. A setter at
+`0x482c30` can switch between `0x18` and `0x38`. Live ABM066 tests with the
+local `0x38` sender produced recognizable but regularly cut/interlaced images,
+which is consistent with a receiver expecting `0x18`-byte addressed chunks while
+the host advances offsets by `0x38`. The local uploader therefore defaults to
+the constructor value, `0x18`.
+
+For the padded `65536` byte RGB565 payload, the default `0x18` mode means:
 
 ```text
-ceil(65536 / 56) = 1171 packets
+ceil(65536 / 24) = 2731 packets
 ```
 
-The app waits about 500 ms after the first successful `0x21` packet whose offset
-is zero.
+The Windows app waits about 500 ms after the first successful `0x21` packet
+whose offset is zero. The local uploader does not currently include this
+host-side sleep; confirmed ABM066 image writes work without it.
 
 In the all-frame sender at `0x481850`, the payload offset is a local loop
 counter initialized to zero and incremented by the sent chunk length. No caller
@@ -516,6 +573,10 @@ The protocol stream carries frame count metadata, not per-frame timing metadata.
 The current evidence points to one global frame interval in the config record,
 not individual GIF frame delays.
 
+Community notes recommend exporting GIFs at `96x160`, `16` fps and setting the
+keyboard software interval to `60` ms. If encoded in the config, `60` ms would
+be bytes `3c 00` at offsets `43..44`.
+
 ### Config Mutation Boundaries
 
 The official config writer reconstructs many UI-derived bytes before sending
@@ -523,8 +584,11 @@ command `0x06`. The clock-only update boundary inferred from the data format is
 to preserve the current 48-byte record and replace only offsets `35..41`.
 
 The custom image metadata boundary inferred from the all-frame path is to
-preserve the current 48-byte record and replace offsets `33`, `34`, and `46`;
-Windows also refreshes clock offsets `35..41` when it writes this record.
+preserve the current 48-byte record and replace offsets `34` and `46`. Windows
+also writes offset `33` from an in-memory selector value and refreshes clock
+offsets `35..41` when it writes this record. Live ABM066 testing showed a
+known-good template with offset `33 = 0`, so a local uploader should preserve
+offset `33` unless the selector semantics are deliberately being tested.
 
 On this protocol even a read operation requires sending a HID output report
 containing command `0x05`. That is a non-mutating query at the protocol level,
@@ -558,6 +622,8 @@ Still-image import:
   set
 - Calls `cv::resize` to the screen dimensions when the imported image size does
   not already match object fields `0x28b4` and `0x28b8`
+- The confirmed path is a direct stretch-to-fit resize; no aspect-ratio
+  preserving contain/cover behavior has been found in this path
 - Adds the resulting frame to the screen-frame list
 
 Animated/video import, including GIFs:
@@ -596,19 +662,42 @@ For the ABM066 dimensions, each frame occupies:
 padded frame size = 65536 bytes
 ```
 
+Static analysis confirms this padding is per frame, not only at the end of the
+combined stream. Function `0x4ade00` computes a padded frame stride by rounding
+the raw RGB565 frame size up to the next `32768`-byte boundary, allocates
+`frame_stride * total_frames`, and copies each converted frame to:
+
+```text
+combined_payload + frame_index * frame_stride
+```
+
 So two still images, one in `GIF1` and one in `GIF2`, would send:
 
 ```text
 2 * 65536 = 131072 bytes
-ceil(131072 / 56) = 2341 command 0x21 packets
+ceil(131072 / 24) = 5462 command 0x21 packets
 ```
+
+Live ABM066 note: the observed custom-view frame boundary is `32768` bytes, not
+`65536` bytes. If bucket 2 is placed at offset `0x10000`, both custom views show
+content from the first host frame halves. If bucket 2 is placed at offset
+`0x8000`, the second custom view shows bucket 2 content. The current local
+uploader therefore packs live ABM066 bucket frames as `32768` byte device frames:
+
+```text
+2 * 32768 = 65536 bytes
+ceil(65536 / 24) = 2731 command 0x21 packets
+```
+
+The mismatch between the Windows host-side `65536` byte frame stride and the
+ABM066 live `32768` byte device stride is not fully reconciled yet.
 
 Before handing the combined payload to the async image worker, the Windows app
 updates the 48-byte config record fields that describe the custom-image storage:
 
 | Config offset | Windows source | Meaning inferred from use |
 | ---: | --- | --- |
-| `33` | selected custom bucket plus `1` in the all-frame path | active/custom image selector for all-frame upload |
+| `33` | object field `0x28a4 + 1` in the all-frame path | active/custom image selector byte; `0` is valid on known-good ABM066 template |
 | `34` | `ScreenFrame1.json` frame count | `GIF1` frame count |
 | `46` | `ScreenFrame2.json` frame count | `GIF2` frame count |
 
@@ -620,6 +709,12 @@ object + 0x2380 -> config[33]
 object + 0x2381 -> config[34]
 object + 0x238d -> config[46]
 ```
+
+The exact offset `33` semantics are still not fully resolved. Static analysis
+shows the all-frame path writes `object[0x28a4] + 1`, while the single-image path
+writes `object[0x28a4]` directly. Because `0xff + 1` wraps to `0x00`, the
+known-good `0` value is consistent with an in-memory selector of `-1` or
+"default/no explicit custom selection".
 
 The same config writer is function `0x49f5c0`, already identified for the clock
 work. It sends command `0x06` with a 48-byte payload and offset:
@@ -706,3 +801,22 @@ Current unresolved details:
   `0x23` reports an error to its caller.
 - The exact OpenCV backend behavior for GIF subrectangle/disposal compositing on
   the bundled Windows runtime.
+- The exact display meaning of config offset `33`. The current local tool
+  preserves it by default because forcing it away from the known-good value `0`
+  correlated with split/striped custom-image output during live tests.
+- Whether any ABM066 firmware/config variant sets the imported-image rotate flag
+  at object field `0x28bc`; live hardware behavior indicates the ABM066 needs
+  the equivalent host-side portrait pre-rotation.
+- Live mapping tests with a nine-band physical X ruler showed one custom view
+  displaying approximately bands `0..4` and the other displaying bands `4..8`
+  from the same uploaded image. A later A/B bucket test showed no visible `B`
+  labels in the second custom view when bucket 2 was placed at byte `0x10000`.
+  A red/green versus blue/yellow boundary test then showed view 1 reading the
+  first `0x8000` bytes and view 2 reading the second `0x8000` bytes of the first
+  uploaded host frame. The local uploader now places bucket frames on `0x8000`
+  byte boundaries by default. Community notes identify the physical screen as
+  `96x160`; live artifacts indicate the device reads a `160x96` RGB565 memory
+  frame and rotates it onto the portrait LCD. That gives `30720` RGB565 bytes
+  plus `2048` padding bytes inside each `0x8000` device frame. The earlier
+  portrait-row-major, `135x120`, and `128x128` candidates produced
+  staircase/interleave artifacts or had the wrong aspect ratio.
