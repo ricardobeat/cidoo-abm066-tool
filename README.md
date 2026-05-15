@@ -16,7 +16,8 @@ make -C tools
 - Dry-run commands do not open HID and do not send reports.
 - Template reads send command `0x05`; this is a non-mutating protocol query, but
   it is still a USB/HID output report.
-- Clock/config tools still use their own safety flags.
+- `cidoo-clock` no longer requires write confirmation flags. Clock updates still
+  re-read the current record and verify that only bytes `35..41` change.
 - `cidoo-image upload-buckets` no longer requires write confirmation flags; use
   `dry-run-buckets` first when changing inputs.
 - Bucket image uploads are confirmed on ABM066 with the `lcd160x96` encoder.
@@ -52,7 +53,6 @@ Read the current 48-byte template:
 
 ```sh
 ./tools/cidoo-clock read-template \
-  --allow-hid-query \
   --slot 0 \
   --out cidoo-template.bin
 ```
@@ -62,35 +62,25 @@ Dry-run a clock update from a saved template:
 ```sh
 ./tools/cidoo-clock dry-run \
   --template-file cidoo-template.bin \
-  --print-packets
+  --debug
 ```
 
-Write only the clock bytes after checking the current stable hash:
+Write only the clock bytes:
 
 ```sh
-./tools/cidoo-clock update-time \
-  --allow-hid-query \
-  --allow-config-write \
-  --expected-stable-sha256 PUT_CURRENT_STABLE_SHA256_HERE \
-  --confirm-write PATCH_ONLY_BYTES_35_41
+./tools/cidoo-clock update-time
 ```
 
-Restore the known-good 48-byte template after first reading the current stable
-hash:
+Restore the known-good 48-byte template:
 
 ```sh
 ./tools/cidoo-clock restore-template \
-  --allow-hid-query \
-  --allow-config-write \
-  --template-file backups/cidoo-template-known-good-restored-latest.bin \
-  --expected-stable-sha256 PUT_CURRENT_STABLE_SHA256_HERE \
-  --expected-template-sha256 b7f6a3ddbdf5412fe750612e445913a0a1ecfef875e9cbcbe82a8d6de3201e14 \
-  --confirm-write RESTORE_48_BYTE_TEMPLATE
+  --template-file backups/cidoo-template-known-good-restored-latest.bin
 ```
 
-Use the current stable hash from a fresh `read-template`, not an old hash copied
-from this file. If the device currently matches the known-good stable hash, the
-value will be:
+Optional hash guards are still available as `--expected-stable-sha256` for the
+currently connected device and `--expected-template-sha256` for a restore file.
+If the device currently matches the known-good stable hash, the value will be:
 
 ```text
 7feb12ff4d6aafc9e0d95fec4c2d4ab366275cfdbdee397545a84230d580cbff
@@ -198,7 +188,6 @@ Before any real image upload:
 make -C tools
 
 ./tools/cidoo-clock read-template \
-  --allow-hid-query \
   --slot 0 \
   --out cidoo-template.bin
 
@@ -309,7 +298,6 @@ and use the stable hash printed by that read:
 
 ```sh
 ./tools/cidoo-clock read-template \
-  --allow-hid-query \
   --slot 0 \
   --out cidoo-template.bin
 ```
@@ -318,12 +306,7 @@ Then restore the known-good 48-byte config template:
 
 ```sh
 ./tools/cidoo-clock restore-template \
-  --allow-hid-query \
-  --allow-config-write \
-  --template-file backups/cidoo-template-known-good-restored-latest.bin \
-  --expected-stable-sha256 PUT_CURRENT_STABLE_SHA256_HERE \
-  --expected-template-sha256 b7f6a3ddbdf5412fe750612e445913a0a1ecfef875e9cbcbe82a8d6de3201e14 \
-  --confirm-write RESTORE_48_BYTE_TEMPLATE
+  --template-file backups/cidoo-template-known-good-restored-latest.bin
 ```
 
 This restores config metadata only. If the image store itself has been erased or
