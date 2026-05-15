@@ -28,6 +28,18 @@
         "CoreGraphics.framework",
         "ImageIO.framework"
       ]
+    },
+    "web-core": {
+      "type": "executable",
+      "name": "cdoo-core",
+      "target": "wasm32",
+      "sources-override": [ "src/core.c3" ],
+      "output": "build",
+      "safe": false,
+      "opt": "Oz",
+      "no-entry": true,
+      "link-libc": false,
+      "extension": ".wasm"
     }
   }
 }

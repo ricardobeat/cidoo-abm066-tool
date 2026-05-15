@@ -23,8 +23,6 @@
 #define DEFAULT_USAGE_PAGE 0xff1c
 #define DEFAULT_USAGE 0x92
 #define DEFAULT_REPORT_ID 0x04
-#define WRITE_CONFIRM_TEXT "PATCH_ONLY_BYTES_35_41"
-#define RESTORE_CONFIRM_TEXT "RESTORE_48_BYTE_TEMPLATE"
 
 typedef enum {
     CMD_NONE,
@@ -59,10 +57,7 @@ typedef struct {
     const char *out_file;
     const char *expected_template_sha256;
     const char *expected_stable_sha256;
-    const char *confirm_write;
-    bool print_packets;
-    bool allow_hid_query;
-    bool allow_config_write;
+    bool debug;
     bool strip_report_id_for_iohid;
 } options_t;
 
@@ -99,17 +94,13 @@ static void usage(FILE *stream) {
         "Usage:\n"
         "  cidoo-clock list [options]\n"
         "  cidoo-clock probe [options]\n"
-        "  cidoo-clock get-feature --allow-hid-query [options]\n"
-        "  cidoo-clock read-raw --allow-hid-query --raw-command HEX [options]\n"
+        "  cidoo-clock get-feature [options]\n"
+        "  cidoo-clock read-raw --raw-command HEX [options]\n"
         "  cidoo-clock dry-run --template HEX|--template-file PATH [options]\n"
-        "  cidoo-clock read-template --allow-hid-query [options]\n"
-        "  cidoo-clock read-template-split --allow-hid-query [options]\n"
-        "  cidoo-clock update-time --allow-hid-query --allow-config-write \\\n"
-        "      --expected-stable-sha256 HEX \\\n"
-        "      --confirm-write " WRITE_CONFIRM_TEXT " [options]\n"
-        "  cidoo-clock restore-template --template-file PATH --allow-hid-query \\\n"
-        "      --expected-stable-sha256 CURRENT_HEX [--allow-config-write \\\n"
-        "      --confirm-write " RESTORE_CONFIRM_TEXT "] [options]\n"
+        "  cidoo-clock read-template [options]\n"
+        "  cidoo-clock read-template-split [options]\n"
+        "  cidoo-clock update-time [options]\n"
+        "  cidoo-clock restore-template --template-file PATH [options]\n"
         "\n"
         "Options:\n"
         "  --vid HEX                         USB VID, default 0x%04x\n"
@@ -126,23 +117,18 @@ static void usage(FILE *stream) {
         "  --template-file PATH              48-byte raw file or hex text file\n"
         "  --out PATH                        write read-template record to raw file\n"
         "  --expected-template-sha256 HEX    optional full-record update guard\n"
-        "  --expected-stable-sha256 HEX      required update guard; time bytes masked\n"
-        "  --print-packets                   print 64-byte HID packets\n"
+        "  --expected-stable-sha256 HEX      optional guard; time bytes 35..41 masked\n"
+        "  --debug                           print hashes, diffs, and HID packets\n"
         "  --timeout-ms N                    HID response timeout, default 1500\n"
-        "  --allow-hid-query                 permit command 0x05 query report\n"
-        "  --allow-config-write              permit command 0x06 config write path\n"
-        "  --confirm-write TEXT              update-time: " WRITE_CONFIRM_TEXT "\n"
-        "                                    restore-template: " RESTORE_CONFIRM_TEXT "\n"
         "  --strip-report-id-for-iohid       diagnostic: pass bytes 1..63 to IOKit\n"
         "\n"
         "Safety model:\n"
-        "  dry-run never opens HID. read-template sends only command 0x05 after the\n"
-        "  explicit query flag. update-time reads the current 48-byte record, patches\n"
-        "  only bytes 35..41, verifies no other byte changed, checks the stable\n"
-        "  template hash, then writes only after both explicit write flags are present.\n"
-        "  restore-template reads the current record and prints the restore diff first;\n"
-        "  it writes only when --allow-config-write and the restore confirmation text\n"
-        "  are also present.\n",
+        "  dry-run never opens HID. read-template sends only command 0x05. update-time\n"
+        "  reads the current 48-byte record, patches only bytes 35..41, verifies no\n"
+        "  other byte changed, then writes. restore-template reads the current record,\n"
+        "  patches the restore template with the current local time, and writes the\n"
+        "  resulting 48-byte record. Optional expected-hash flags remain available as\n"
+        "  extra guards.\n",
         DEFAULT_VID, DEFAULT_PID, DEFAULT_USAGE_PAGE, DEFAULT_USAGE, DEFAULT_REPORT_ID);
 }
 
@@ -737,11 +723,6 @@ static int probe_devices(const options_t *opt) {
 }
 
 static int get_feature_report(const options_t *opt) {
-    if (!opt->allow_hid_query) {
-        fprintf(stderr, "Refusing HID feature read without --allow-hid-query\n");
-        return 2;
-    }
-
     hid_session_t session;
     uint8_t report[REPORT_SIZE];
     CFIndex report_len = REPORT_SIZE;
@@ -770,10 +751,6 @@ static int get_feature_report(const options_t *opt) {
 }
 
 static int run_read_raw(const options_t *opt) {
-    if (!opt->allow_hid_query) {
-        fprintf(stderr, "Refusing raw HID read without --allow-hid-query\n");
-        return 2;
-    }
     if (opt->raw_command == 0) {
         fprintf(stderr, "read-raw needs --raw-command HEX\n");
         return 2;
@@ -790,7 +767,9 @@ static int run_read_raw(const options_t *opt) {
     }
 
     build_config_packet(opt->report_id, opt->raw_command, NULL, opt->raw_length, offset, packet);
-    print_hex("raw read packet: ", packet, REPORT_SIZE);
+    if (opt->debug) {
+        print_hex("raw read packet: ", packet, REPORT_SIZE);
+    }
     int rc = send_report_wait(&session,
                               packet,
                               opt->raw_command,
@@ -1035,7 +1014,7 @@ static int read_template_from_device(const options_t *opt,
                             chunk_len,
                             (uint16_t)(offset + pos),
                             packet);
-        if (opt->print_packets) {
+        if (opt->debug) {
             snprintf(label,
                      sizeof(label),
                      "cmd 0x05 chunk offset=0x%04x packet: ",
@@ -1052,7 +1031,7 @@ static int read_template_from_device(const options_t *opt,
                                      false) != 0) {
             return -1;
         }
-        if (opt->print_packets) {
+        if (opt->debug) {
             snprintf(label,
                      sizeof(label),
                      "cmd 0x05 chunk offset=0x%04x response: ",
@@ -1097,7 +1076,7 @@ static int write_time_to_device(const options_t *opt,
     build_config_packet(opt->report_id, 0x06, patched, RECORD_SIZE, slot_offset(opt->slot), write);
     build_simple_packet(opt->report_id, 0x02, commit);
 
-    if (opt->print_packets) {
+    if (opt->debug) {
         print_hex("cmd 0x01 packet: ", begin, REPORT_SIZE);
         print_hex("cmd 0x06 packet: ", write, REPORT_SIZE);
         print_hex("cmd 0x02 packet: ", commit, REPORT_SIZE);
@@ -1147,21 +1126,23 @@ static int run_dry_run(const options_t *opt) {
     sha256_hex(patched, RECORD_SIZE, hash_after);
     stable_sha256_hex(template_record, stable_hash_before);
     stable_sha256_hex(patched, stable_hash_after);
-    print_hex("template: ", template_record, RECORD_SIZE);
-    print_hex("patched:  ", patched, RECORD_SIZE);
-    printf("template sha256: %s\n", hash_before);
-    printf("patched  sha256: %s\n", hash_after);
-    printf("template stable sha256: %s\n", stable_hash_before);
-    printf("patched  stable sha256: %s\n", stable_hash_after);
     print_time_fields("old time bytes", template_record);
     print_time_fields("new time bytes", patched);
-    print_record_diff(template_record, patched);
+    if (opt->debug) {
+        print_hex("template: ", template_record, RECORD_SIZE);
+        print_hex("patched:  ", patched, RECORD_SIZE);
+        printf("template sha256: %s\n", hash_before);
+        printf("patched  sha256: %s\n", hash_after);
+        printf("template stable sha256: %s\n", stable_hash_before);
+        printf("patched  stable sha256: %s\n", stable_hash_after);
+        print_record_diff(template_record, patched);
+    }
 
     if (validate_time_fields(template_record, why, sizeof(why)) != 0) {
         printf("template time validation warning: %s\n", why);
     }
 
-    if (opt->print_packets) {
+    if (opt->debug) {
         build_config_packet(opt->report_id, 0x06, patched, RECORD_SIZE, slot_offset(opt->slot), packet);
         print_hex("cmd 0x06 packet: ", packet, REPORT_SIZE);
     }
@@ -1171,11 +1152,6 @@ static int run_dry_run(const options_t *opt) {
 }
 
 static int run_read_template(const options_t *opt) {
-    if (!opt->allow_hid_query) {
-        fprintf(stderr, "Refusing HID query without --allow-hid-query\n");
-        return 2;
-    }
-
     hid_session_t session;
     uint8_t record[RECORD_SIZE];
     char hash[65];
@@ -1219,11 +1195,6 @@ static int run_read_template(const options_t *opt) {
 }
 
 static int run_read_template_split(const options_t *opt) {
-    if (!opt->allow_hid_query) {
-        fprintf(stderr, "Refusing HID query without --allow-hid-query\n");
-        return 2;
-    }
-
     options_t tx_opt = *opt;
     options_t rx_opt = *opt;
     tx_opt.usage_page = 0xff1c;
@@ -1261,7 +1232,7 @@ static int run_read_template_split(const options_t *opt) {
     memset(rx_session.input_report, 0, sizeof(rx_session.input_report));
 
     build_config_packet(tx_opt.report_id, 0x05, NULL, RECORD_SIZE, slot_offset(opt->slot), packet);
-    if (opt->print_packets) {
+    if (opt->debug) {
         print_hex("split tx cmd 0x05 packet: ", packet, REPORT_SIZE);
     }
 
@@ -1273,7 +1244,7 @@ static int run_read_template_split(const options_t *opt) {
                          &tx_response_len) != 0) {
         goto out;
     }
-    if (opt->print_packets) {
+    if (opt->debug) {
         print_hex("split tx cmd 0x05 response: ", tx_response, tx_response_len);
     }
 
@@ -1288,7 +1259,7 @@ static int run_read_template_split(const options_t *opt) {
 
     memcpy(rx_response, rx_session.response, rx_session.response_len);
     rx_response_len = rx_session.response_len;
-    if (opt->print_packets) {
+    if (opt->debug) {
         print_hex("split rx response: ", rx_response, rx_response_len);
     }
     if (rx_response_len < CONFIG_PAYLOAD_OFFSET + RECORD_SIZE) {
@@ -1339,25 +1310,6 @@ out:
 }
 
 static int run_update_time(const options_t *opt) {
-    if (!opt->allow_hid_query) {
-        fprintf(stderr, "Refusing update without --allow-hid-query\n");
-        return 2;
-    }
-    if (!opt->allow_config_write) {
-        fprintf(stderr, "Refusing update without --allow-config-write\n");
-        return 2;
-    }
-    if (opt->confirm_write == NULL ||
-        strcmp(opt->confirm_write, WRITE_CONFIRM_TEXT) != 0) {
-        fprintf(stderr,
-                "Refusing update without --confirm-write " WRITE_CONFIRM_TEXT "\n");
-        return 2;
-    }
-    if (opt->expected_stable_sha256 == NULL) {
-        fprintf(stderr, "Refusing update without --expected-stable-sha256 from read-template\n");
-        return 2;
-    }
-
     hid_session_t session;
     uint8_t current[RECORD_SIZE];
     uint8_t patched[RECORD_SIZE];
@@ -1388,7 +1340,8 @@ static int run_update_time(const options_t *opt) {
                     opt->expected_template_sha256);
             rc = -1;
         }
-        if (!hex_equals_ci(stable_hash_current, opt->expected_stable_sha256)) {
+        if (opt->expected_stable_sha256 != NULL &&
+            !hex_equals_ci(stable_hash_current, opt->expected_stable_sha256)) {
             fprintf(stderr,
                     "Refusing update: stable template sha256 %s does not match expected %s\n",
                     stable_hash_current,
@@ -1407,13 +1360,15 @@ static int run_update_time(const options_t *opt) {
     if (rc == 0) {
         sha256_hex(patched, RECORD_SIZE, hash_patched);
         stable_sha256_hex(patched, stable_hash_patched);
-        printf("current template sha256: %s\n", hash_current);
-        printf("patched  template sha256: %s\n", hash_patched);
-        printf("current stable sha256: %s\n", stable_hash_current);
-        printf("patched  stable sha256: %s\n", stable_hash_patched);
-        print_time_fields("old time bytes", current);
         print_time_fields("new time bytes", patched);
-        print_record_diff(current, patched);
+        if (opt->debug) {
+            printf("current template sha256: %s\n", hash_current);
+            printf("patched  template sha256: %s\n", hash_patched);
+            printf("current stable sha256: %s\n", stable_hash_current);
+            printf("patched  stable sha256: %s\n", stable_hash_patched);
+            print_time_fields("old time bytes", current);
+            print_record_diff(current, patched);
+        }
         rc = write_time_to_device(opt, &session, patched);
     }
 
@@ -1426,17 +1381,8 @@ static int run_update_time(const options_t *opt) {
 }
 
 static int run_restore_template(const options_t *opt) {
-    if (!opt->allow_hid_query) {
-        fprintf(stderr, "Refusing restore without --allow-hid-query\n");
-        return 2;
-    }
     if (opt->template_hex == NULL && opt->template_file == NULL) {
         fprintf(stderr, "restore-template needs --template or --template-file PATH\n");
-        return 2;
-    }
-    if (opt->expected_stable_sha256 == NULL) {
-        fprintf(stderr,
-                "Refusing restore without --expected-stable-sha256 for the current record\n");
         return 2;
     }
 
@@ -1485,7 +1431,8 @@ static int run_restore_template(const options_t *opt) {
 
     sha256_hex(current, RECORD_SIZE, current_hash);
     stable_sha256_hex(current, current_stable_hash);
-    if (!hex_equals_ci(current_stable_hash, opt->expected_stable_sha256)) {
+    if (opt->expected_stable_sha256 != NULL &&
+        !hex_equals_ci(current_stable_hash, opt->expected_stable_sha256)) {
         fprintf(stderr,
                 "Refusing restore: current stable template sha256 %s does not match expected %s\n",
                 current_stable_hash,
@@ -1495,31 +1442,19 @@ static int run_restore_template(const options_t *opt) {
 
     sha256_hex(patched, RECORD_SIZE, patched_hash);
     stable_sha256_hex(patched, patched_stable_hash);
-    printf("current template sha256: %s\n", current_hash);
-    printf("current stable sha256: %s\n", current_stable_hash);
-    printf("restore template sha256: %s\n", restore_hash);
-    printf("restore stable sha256: %s\n", restore_stable_hash);
-    printf("patched  template sha256: %s\n", patched_hash);
-    printf("patched  stable sha256: %s\n", patched_stable_hash);
-    print_hex("current:  ", current, RECORD_SIZE);
-    print_hex("restore:  ", restore_template, RECORD_SIZE);
-    print_hex("patched:  ", patched, RECORD_SIZE);
-    print_time_fields("current time bytes", current);
     print_time_fields("patched time bytes", patched);
-    print_record_diff(current, patched);
-
-    if (!opt->allow_config_write) {
-        printf("No config write sent. Add --allow-config-write and --confirm-write "
-               RESTORE_CONFIRM_TEXT " to write this restore record.\n");
-        rc = 0;
-        goto out;
-    }
-    if (opt->confirm_write == NULL ||
-        strcmp(opt->confirm_write, RESTORE_CONFIRM_TEXT) != 0) {
-        fprintf(stderr,
-                "Refusing restore without --confirm-write " RESTORE_CONFIRM_TEXT "\n");
-        rc = 2;
-        goto out;
+    if (opt->debug) {
+        printf("current template sha256: %s\n", current_hash);
+        printf("current stable sha256: %s\n", current_stable_hash);
+        printf("restore template sha256: %s\n", restore_hash);
+        printf("restore stable sha256: %s\n", restore_stable_hash);
+        printf("patched  template sha256: %s\n", patched_hash);
+        printf("patched  stable sha256: %s\n", patched_stable_hash);
+        print_hex("current:  ", current, RECORD_SIZE);
+        print_hex("restore:  ", restore_template, RECORD_SIZE);
+        print_hex("patched:  ", patched, RECORD_SIZE);
+        print_time_fields("current time bytes", current);
+        print_record_diff(current, patched);
     }
 
     if (write_time_to_device(opt, &session, patched) != 0) {
@@ -1597,11 +1532,8 @@ static int parse_options(int argc, char **argv, options_t *opt) {
         {"template-file", required_argument, NULL, 1011},
         {"out", required_argument, NULL, 1012},
         {"expected-template-sha256", required_argument, NULL, 1013},
-        {"print-packets", no_argument, NULL, 1014},
+        {"debug", no_argument, NULL, 1014},
         {"timeout-ms", required_argument, NULL, 1015},
-        {"allow-hid-query", no_argument, NULL, 1016},
-        {"allow-config-write", no_argument, NULL, 1017},
-        {"confirm-write", required_argument, NULL, 1018},
         {"expected-stable-sha256", required_argument, NULL, 1019},
         {"strip-report-id-for-iohid", no_argument, NULL, 1020},
         {"help", no_argument, NULL, 'h'},
@@ -1675,19 +1607,10 @@ static int parse_options(int argc, char **argv, options_t *opt) {
                 opt->expected_template_sha256 = optarg;
                 break;
             case 1014:
-                opt->print_packets = true;
+                opt->debug = true;
                 break;
             case 1015:
                 opt->timeout_ms = parse_int_range(optarg, "--timeout-ms", 100, 30000);
-                break;
-            case 1016:
-                opt->allow_hid_query = true;
-                break;
-            case 1017:
-                opt->allow_config_write = true;
-                break;
-            case 1018:
-                opt->confirm_write = optarg;
                 break;
             case 1019:
                 opt->expected_stable_sha256 = optarg;

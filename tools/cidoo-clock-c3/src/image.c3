@@ -246,24 +246,6 @@ fn CGRect make_rect(double x, double y, double width, double height) {
     return rect;
 }
 
-fn void encode_lcd160x96_frame(char* logical, char* frame) {
-    clear_pointer_bytes(frame, DEFAULT_DEVICE_FRAME_BYTES);
-    for (sz y = 0; y < DEVICE_LCD_MEMORY_HEIGHT; y++) {
-        for (sz x = 0; x < DEVICE_LCD_MEMORY_WIDTH; x++) {
-            sz sx = DEVICE_LCD_WIDTH - 1 - y;
-            sz sy = x;
-            sz src = ((sy * DEVICE_LCD_WIDTH + sx) * 4);
-            uint red = ((uint)logical[src]) & 0xff;
-            uint green = ((uint)logical[src + 1]) & 0xff;
-            uint blue = ((uint)logical[src + 2]) & 0xff;
-            ushort rgb565 = (ushort)(((red >> 3) << 11) | ((green >> 2) << 5) | (blue >> 3));
-            sz dst = y * DEFAULT_DEVICE_ROW_BYTES + x * 2;
-            frame[dst] = (char)((rgb565 >> 8) & 0xff);
-            frame[dst + 1] = (char)(rgb565 & 0xff);
-        }
-    }
-}
-
 fn int finalize_image_upload_plan(char[] current, ImageUploadPlan* plan) {
     plan.existing_bucket1_frames = (sz)(((uint)current[BUCKET1_COUNT_OFFSET]) & 0xff);
     plan.existing_bucket2_frames = (sz)(((uint)current[BUCKET2_COUNT_OFFSET]) & 0xff);
@@ -281,20 +263,9 @@ fn int finalize_image_upload_plan(char[] current, ImageUploadPlan* plan) {
 }
 
 fn int patch_image_config(char[] before, ImageUploadPlan* plan, char[] after) {
-    for (sz i = 0; i < RECORD_SIZE; i++) after[i] = before[i];
-    after[ACTIVE_BUCKET_OFFSET] = (char)plan.final_active_selector;
-    after[BUCKET1_COUNT_OFFSET] = (char)plan.final_bucket1_frames;
-    after[BUCKET2_COUNT_OFFSET] = (char)plan.final_bucket2_frames;
-    return verify_only_image_metadata_changed(before, after);
-}
-
-fn int verify_only_image_metadata_changed(char[] before, char[] after) {
-    for (sz i = 0; i < RECORD_SIZE; i++) {
-        bool allowed = i == ACTIVE_BUCKET_OFFSET || i == BUCKET1_COUNT_OFFSET || i == BUCKET2_COUNT_OFFSET;
-        if (!allowed && before[i] != after[i]) {
-            io::printfn("Refusing: unexpected config byte changed at offset %d", i);
-            return -1;
-        }
+    if (patch_image_config_record(before, plan.final_active_selector, plan.final_bucket1_frames, plan.final_bucket2_frames, after) != 0) {
+        io::printfn("Refusing: invalid image metadata values");
+        return -1;
     }
     return 0;
 }
@@ -447,26 +418,24 @@ fn int write_image_payload_to_device(Options* opt, ClockTransport* transport, Im
     return 0;
 }
 
-fn sz payload_packet_count(sz payload_len) {
-    return (payload_len + DEFAULT_IMAGE_CHUNK_SIZE - 1) / DEFAULT_IMAGE_CHUNK_SIZE;
-}
-
 fn sz image_prepare_frame_count(ImageUploadPlan* plan) {
-    sz existing_total = plan.existing_bucket1_frames + plan.existing_bucket2_frames;
-    sz final_total = plan.final_bucket1_frames + plan.final_bucket2_frames;
-    return existing_total > final_total ? existing_total : final_total;
+    return image_prepare_frame_count_values(
+        plan.existing_bucket1_frames,
+        plan.existing_bucket2_frames,
+        plan.final_bucket1_frames,
+        plan.final_bucket2_frames);
 }
 
 fn int image_prepare_windows_timeout_ms(ImageUploadPlan* plan) {
-    return (int)(image_prepare_frame_count(plan) * IMAGE_PREPARE_PER_FRAME_TIMEOUT_MS + IMAGE_PREPARE_BASE_TIMEOUT_MS);
+    return image_prepare_windows_timeout_ms_values(
+        plan.existing_bucket1_frames,
+        plan.existing_bucket2_frames,
+        plan.final_bucket1_frames,
+        plan.final_bucket2_frames);
 }
 
 fn int image_prepare_wait_ms(Options* opt) {
     return opt.timeout_ms > IMAGE_PREPARE_WAIT_MS ? opt.timeout_ms : IMAGE_PREPARE_WAIT_MS;
-}
-
-fn void clear_pointer_bytes(char* bytes, sz len) {
-    for (sz i = 0; i < len; i++) bytes[i] = 0;
 }
 
 fn bool confirm_image_upload_prompt() {

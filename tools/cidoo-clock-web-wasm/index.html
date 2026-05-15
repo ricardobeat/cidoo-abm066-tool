@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>cdoo</title>
+    <link rel="stylesheet" href="./styles.css">
+    <script type="module" src="./app.mjs"></script>
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <h1>cdoo</h1>
+          <p id="status" role="status">Loading</p>
+        </div>
+      </header>
+
+      <section class="panel" aria-label="Clock">
+        <button id="updateClock" type="button">Update Clock</button>
+      </section>
+
+      <section class="panel upload" aria-label="Images">
+        <div class="image-picker">
+          <p class="image-title">Image 1</p>
+          <label id="image1Box" class="preview-box" for="image1">
+            <span>select image</span>
+            <img id="image1Preview" alt="Image 1 preview" hidden>
+          </label>
+          <input id="image1" class="file-input" type="file" accept=".gif,image/gif">
+          <p id="image1Meta"></p>
+        </div>
+        <div class="image-picker">
+          <p class="image-title">Image 2</p>
+          <label id="image2Box" class="preview-box" for="image2">
+            <span>select image</span>
+            <img id="image2Preview" alt="Image 2 preview" hidden>
+          </label>
+          <input id="image2" class="file-input" type="file" accept=".gif,image/gif">
+          <p id="image2Meta"></p>
+        </div>
+        <button id="uploadImages" type="button">Upload Images</button>
+        <p id="imageStatus" role="status"></p>
+      </section>
+    </main>
+  </body>
+</html>

@@ -4,37 +4,6 @@ import std::io;
 import std::thread;
 import std::time::datetime;
 
-fn bool is_time_offset(sz i) {
-    return i >= TIME_OFFSET && i < TIME_OFFSET + TIME_SIZE;
-}
-
-fn char bcd(int value) {
-    return (char)(((value / 10) << 4) | (value % 10));
-}
-
-fn int unbcd(char value) {
-    int hi = (int)((value >> 4) & 0x0f);
-    int lo = (int)(value & 0x0f);
-    if (hi > 9 || lo > 9) return -1;
-    return hi * 10 + lo;
-}
-
-fn bool bcd_in_range(char value, int min, int max) {
-    int decoded = unbcd(value);
-    return decoded >= min && decoded <= max;
-}
-
-fn String time_validation_error(char[] record) {
-    if (!bcd_in_range(record[35], 0, 59)) return "seconds byte 35 is not valid BCD 00..59";
-    if (!bcd_in_range(record[36], 0, 59)) return "minutes byte 36 is not valid BCD 00..59";
-    if (!bcd_in_range(record[37], 0, 23)) return "hours byte 37 is not valid BCD 00..23";
-    if (record[38] > 6) return "weekday byte 38 is not in range 0..6";
-    if (!bcd_in_range(record[39], 1, 31)) return "day byte 39 is not valid BCD 01..31";
-    if (!bcd_in_range(record[40], 1, 12)) return "month byte 40 is not valid BCD 01..12";
-    if (!bcd_in_range(record[41], 0, 99)) return "year byte 41 is not valid BCD 00..99";
-    return "ok";
-}
-
 fn void print_time_fields(String label, char[] record) {
     int sec = unbcd(record[35]);
     int min = unbcd(record[36]);
@@ -122,36 +91,20 @@ fn int fill_time_bytes(String arg, char[] out) {
     }
 }
 
-fn void write_time_bytes(int sec, int min, int hour, int weekday, int day, int mon, int year, char[] out) {
-    out[0] = bcd(sec);
-    out[1] = bcd(min);
-    out[2] = bcd(hour);
-    out[3] = (char)weekday;
-    out[4] = bcd(day);
-    out[5] = bcd(mon);
-    out[6] = bcd(year % 100);
-}
-
 fn int weekday_clock_value(Weekday weekday) {
     if (weekday == Weekday.SUNDAY) return 0;
     return (int)weekday.ordinal + 1;
 }
 
-fn void patch_time(char[] input, char[] time_bytes, char[] output) {
-    for (sz i = 0; i < RECORD_SIZE; i++) output[i] = input[i];
-    for (sz i = 0; i < TIME_SIZE; i++) output[TIME_OFFSET + i] = time_bytes[i];
-}
-
 fn int verify_only_time_changed(char[] before, char[] after, bool debug) {
-    for (sz i = 0; i < RECORD_SIZE; i++) {
-        if (!is_time_offset(i) && before[i] != after[i]) {
-            if (debug) {
-                io::printfn("Refusing: non-time byte changed at offset %d", i);
-            } else {
-                io::printfn("Refusing: non-time byte changed");
-            }
-            return -1;
+    int offset = time_change_violation_offset(before, after);
+    if (offset >= 0) {
+        if (debug) {
+            io::printfn("Refusing: non-time byte changed at offset %d", offset);
+        } else {
+            io::printfn("Refusing: non-time byte changed");
         }
+        return -1;
     }
     return 0;
 }
@@ -171,10 +124,6 @@ fn void print_record_diff(char[] before, char[] after) {
 
 fn void sleep_millis(long millis) {
     thread::sleep_ms(millis);
-}
-
-fn ushort slot_offset(int slot) {
-    return (ushort)(slot * 0x31);
 }
 
 fn int read_template_from_device(Options* opt, ClockTransport* transport, char[] record) {
