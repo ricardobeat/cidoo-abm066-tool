@@ -1,27 +1,32 @@
 {
   "version": "0.1.0",
   "langrev": "1",
-  "sources": [ "src/**", "vendor/getopt/src/**" ],
+  "sources": [ "src/**", "lib/**" ],
   "output": "build",
   "link-libc": true,
   "targets": {
-    "cidoo-clock-c3": {
+    "cdoo": {
       "type": "executable",
-      "safe": true,
+      "safe": false,
       "opt": "O0",
       "linked-libraries": [
         "IOKit.framework",
-        "CoreFoundation.framework"
+        "CoreFoundation.framework",
+        "CoreGraphics.framework",
+        "ImageIO.framework"
       ]
     },
     "release": {
       "type": "executable",
+      "name": "cdoo",
       "safe": false,
       "opt": "O3",
       "strip-unused": true,
       "linked-libraries": [
         "IOKit.framework",
-        "CoreFoundation.framework"
+        "CoreFoundation.framework",
+        "CoreGraphics.framework",
+        "ImageIO.framework"
       ]
     }
   }
