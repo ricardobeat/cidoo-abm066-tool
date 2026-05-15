@@ -6,6 +6,7 @@
 #include <CommonCrypto/CommonDigest.h>
 
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <getopt.h>
 #include <stdbool.h>
@@ -13,18 +14,32 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
+#include <unistd.h>
 
 #define REPORT_SIZE 64
 #define FRAMEBUFFER_WIDTH 240
 #define FRAMEBUFFER_HEIGHT 135
 #define PORTRAIT_WIDTH 135
 #define PORTRAIT_HEIGHT 240
+#define DEVICE_LCD_WIDTH 96
+#define DEVICE_LCD_HEIGHT 160
+#define DEVICE_LCD_MEMORY_WIDTH 160
+#define DEVICE_LCD_MEMORY_HEIGHT 96
+#define DEVICE_SQUARE_WIDTH 128
+#define DEVICE_SQUARE_HEIGHT 128
+#define DEVICE_HALF_WIDTH 135
+#define DEVICE_HALF_HEIGHT 120
 #define IMAGE_PIXELS (FRAMEBUFFER_WIDTH * FRAMEBUFFER_HEIGHT)
 #define RGB565_SIZE (IMAGE_PIXELS * 2)
 #define PADDED_IMAGE_SIZE 65536
-#define IMAGE_CHUNK_SIZE 0x38
+#define DEFAULT_DEVICE_FRAME_BYTES 32768
+#define DEFAULT_DEVICE_ROW_BYTES (DEVICE_LCD_MEMORY_WIDTH * 2)
 #define IMAGE_PAYLOAD_OFFSET 8
+#define DEFAULT_IMAGE_CHUNK_SIZE 0x18
+#define MAX_IMAGE_CHUNK_SIZE (REPORT_SIZE - IMAGE_PAYLOAD_OFFSET)
 #define CONFIG_RECORD_SIZE 48
 #define CONFIG_SLOT_STRIDE 0x31
 #define CONFIG_PAYLOAD_OFFSET 8
@@ -33,18 +48,18 @@
 #define ACTIVE_BUCKET_OFFSET 33
 #define BUCKET1_COUNT_OFFSET 34
 #define BUCKET2_COUNT_OFFSET 46
-#define DEFAULT_MAX_FRAMES_PER_BUCKET 64
+#define DEFAULT_MAX_FRAMES_PER_BUCKET 200
 #define MAX_HARD_FRAMES_PER_BUCKET 255
-#define MAX_TOTAL_FRAMES 255
+#define MAX_TOTAL_FRAMES 200
 #define DEFAULT_VID 0x320f
 #define DEFAULT_PID 0x5055
 #define DEFAULT_USAGE_PAGE 0xff1c
 #define DEFAULT_USAGE 0x92
 #define DEFAULT_REPORT_ID 0x04
-#define UPLOAD_CONFIRM_TEXT "UPLOAD_SCREEN_IMAGE"
 #define IMAGE_UPLOAD_METADATA_IMPLEMENTED 0
 #define IMAGE_PREPARE_BASE_TIMEOUT_MS 500
 #define IMAGE_PREPARE_PER_FRAME_TIMEOUT_MS 300
+#define IMAGE_PREPARE_WAIT_MS 1500
 
 typedef enum {
     CMD_NONE,
@@ -66,6 +81,14 @@ typedef enum {
     ORIENTATION_PORTRAIT,
 } orientation_t;
 
+typedef enum {
+    DEVICE_LAYOUT_LCD160X96,
+    DEVICE_LAYOUT_LCD96X160,
+    DEVICE_LAYOUT_SQUARE128,
+    DEVICE_LAYOUT_HALF_PORTRAIT,
+    DEVICE_LAYOUT_FRAMEBUFFER,
+} device_layout_t;
+
 typedef struct {
     command_t command;
     uint16_t vid;
@@ -84,20 +107,21 @@ typedef struct {
     const char *bucket2_preview_file;
     const char *bucket1_framebuffer_preview_file;
     const char *bucket2_framebuffer_preview_file;
-    const char *confirm_upload;
     int slot;
     int active_bucket;
     int max_frames_per_bucket;
     int timeout_ms;
+    int image_chunk_size;
+    int device_frame_bytes;
+    int device_row_bytes;
     int rotate_degrees;
     fit_mode_t fit_mode;
     orientation_t orientation;
-    bool allow_hid_query;
-    bool allow_config_write;
-    bool allow_image_write;
+    device_layout_t device_layout;
     bool preserve_clock;
     bool active_bucket_set;
-    bool print_packets;
+    bool device_row_bytes_set;
+    bool debug;
     bool rotate_set;
     bool strip_report_id_for_iohid;
 } options_t;
@@ -119,7 +143,7 @@ typedef struct {
     size_t existing_bucket2_frames;
     size_t final_bucket1_frames;
     size_t final_bucket2_frames;
-    int final_active_bucket;
+    uint8_t final_active_selector;
 } bucket_upload_plan_t;
 
 typedef struct {
@@ -134,29 +158,35 @@ typedef struct {
     bool strip_report_id_for_iohid;
 } hid_session_t;
 
+static const char *device_layout_name(device_layout_t layout);
+static size_t device_layout_width(device_layout_t layout);
+static size_t device_layout_height(device_layout_t layout);
+
 static void usage(FILE *stream) {
     fprintf(stream,
             "Usage:\n"
             "  cidoo-image dry-run --image PATH [options]\n"
-            "  cidoo-image upload --image PATH --allow-image-write \\\n"
-            "      --confirm-upload " UPLOAD_CONFIRM_TEXT " [options]\n"
+            "  cidoo-image upload --image PATH [options]\n"
             "  cidoo-image dry-run-buckets --bucket1 PATH|--bucket2 PATH \\\n"
             "      --template-file PATH [options]\n"
-            "  cidoo-image upload-buckets --bucket1 PATH --bucket2 PATH \\\n"
-            "      --allow-hid-query --allow-config-write --allow-image-write \\\n"
-            "      --expected-stable-sha256 HEX --confirm-upload " UPLOAD_CONFIRM_TEXT " [options]\n"
+            "  cidoo-image upload-buckets --bucket1 PATH --bucket2 PATH [options]\n"
             "\n"
             "Options:\n"
             "  --image PATH                      PNG/JPEG/etc image to upload\n"
             "  --bucket1 PATH                    still image or GIF for Custom1 / GIF1\n"
             "  --bucket2 PATH                    still image or GIF for Custom2 / GIF2\n"
             "  --template-file PATH              48-byte raw template for dry-run-buckets\n"
-            "  --expected-stable-sha256 HEX      upload guard; time bytes 35..41 masked\n"
+            "  --expected-stable-sha256 HEX      optional guard; time bytes 35..41 masked\n"
             "  --slot N                          config slot, offset = N * 0x31, default 0\n"
-            "  --active-bucket 1|2               bucket selected after upload, default auto\n"
-            "  --max-frames-per-bucket N         default %d, hard max %d\n"
-            "  --orientation landscape|portrait  physical screen orientation, default landscape\n"
-            "  --rotate 0|90|180|270             rotate preview into framebuffer\n"
+            "  --active-bucket 1|2               diagnostic selector override; default preserve\n"
+            "  --max-frames-per-bucket N         default %d, hard max %d; total max %d\n"
+            "  --image-chunk-size 24|56          command 0x21 payload bytes, default 24\n"
+            "  --device-frame-bytes 32768|65536  bucket storage stride, default 32768\n"
+            "  --device-row-bytes N              device row stride, default 320\n"
+            "  --device-layout lcd160x96|lcd96x160|square128|half-portrait|framebuffer\n"
+            "                                    RGB565 layout, default lcd160x96\n"
+            "  --orientation landscape|portrait  physical screen orientation, default portrait\n"
+            "  --rotate 0|90|180|270             override preview-to-framebuffer rotation\n"
             "  --preview-out PATH                write fitted physical-screen PNG preview\n"
             "  --framebuffer-preview-out PATH    write encoded 240x135 framebuffer PNG preview\n"
             "  --bucket1-preview-out PATH        write GIF1 first-frame physical preview\n"
@@ -165,30 +195,27 @@ static void usage(FILE *stream) {
             "                                    write GIF1 first-frame framebuffer preview\n"
             "  --bucket2-framebuffer-preview-out PATH\n"
             "                                    write GIF2 first-frame framebuffer preview\n"
-            "  --fit cover|contain|stretch       image fit mode, default cover\n"
+            "  --fit cover|contain|stretch       image fit mode, default stretch\n"
             "  --vid HEX                         USB VID, default 0x%04x\n"
             "  --pid HEX                         USB PID, default 0x%04x\n"
             "  --usage-page HEX                  HID usage page, default 0x%04x\n"
             "  --usage HEX                       HID usage, default 0x%02x\n"
             "  --report-id HEX                   HID report ID, default 0x%02x\n"
             "  --timeout-ms N                    HID response timeout, default 1500\n"
-            "  --print-packets                   print first/last HID packets\n"
-            "  --allow-hid-query                 permit command 0x05 template read\n"
-            "  --allow-config-write              permit command 0x06 config write path\n"
-            "  --allow-image-write               permit command 0x01/0x21/0x02 upload\n"
+            "  --debug                           print hashes, config diffs, and HID packets\n"
             "  --preserve-clock                  do not refresh bytes 35..41 during bucket upload\n"
-            "  --confirm-upload TEXT             must be " UPLOAD_CONFIRM_TEXT "\n"
             "  --strip-report-id-for-iohid       diagnostic: pass bytes 1..63 to IOKit\n"
             "\n"
             "Safety model:\n"
             "  dry-run commands never open HID and never send a report. bucket uploads\n"
-            "  read the current 48-byte template, patch only metadata for requested\n"
-            "  buckets and, unless --preserve-clock is used, bytes 35..41, check the\n"
-            "  stable hash, then send only after all explicit flags are present. Real\n"
-            "  uploads require both buckets because command 0x23 appears to operate on\n"
-            "  the combined custom-image store.\n",
+            "  read the current 48-byte template, preserve the selector byte by default,\n"
+            "  patch only frame counts for requested buckets and, unless --preserve-clock\n"
+            "  is used, bytes 35..41. If --expected-stable-sha256 is provided, the\n"
+            "  freshly-read template must match it. Real uploads require both buckets\n"
+            "  because command 0x23 appears to operate on the combined custom-image store.\n",
             DEFAULT_MAX_FRAMES_PER_BUCKET,
             MAX_HARD_FRAMES_PER_BUCKET,
+            MAX_TOTAL_FRAMES,
             DEFAULT_VID,
             DEFAULT_PID,
             DEFAULT_USAGE_PAGE,
@@ -618,7 +645,8 @@ static int send_report_wait_ignoring_response_error(hid_session_t *session,
                                                     int timeout_ms,
                                                     uint8_t response[REPORT_SIZE],
                                                     size_t *response_len,
-                                                    const char *reason) {
+                                                    bool debug,
+                                                    bool *timed_out) {
     session->expected_cmd = expected_cmd;
     session->got_response = false;
     session->response_len = 0;
@@ -648,11 +676,13 @@ static int send_report_wait_ignoring_response_error(hid_session_t *session,
     while (!session->got_response && monotonic_seconds() < deadline) {
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, true);
     }
+    if (timed_out != NULL) {
+        *timed_out = !session->got_response;
+    }
     if (!session->got_response) {
-        fprintf(stderr,
-                "Timed out waiting for response to cmd=0x%02x; continuing because %s\n",
-                expected_cmd,
-                reason);
+        if (debug) {
+            fprintf(stderr, "Timed out waiting for response to cmd=0x%02x\n", expected_cmd);
+        }
         return 0;
     }
 
@@ -662,11 +692,12 @@ static int send_report_wait_ignoring_response_error(hid_session_t *session,
     }
     if (session->response_len >= 8 &&
         (session->response[7] == 0xff || session->response[7] == 0xfe)) {
-        fprintf(stderr,
-                "Device returned status 0x%02x for cmd=0x%02x; continuing because %s\n",
-                session->response[7],
-                expected_cmd,
-                reason);
+        if (debug) {
+            fprintf(stderr,
+                    "Device returned status 0x%02x for cmd=0x%02x\n",
+                    session->response[7],
+                    expected_cmd);
+        }
     }
     return 0;
 }
@@ -795,7 +826,7 @@ static int read_config_template_from_device(const options_t *opt,
                             chunk_len,
                             (uint16_t)(offset + pos),
                             packet);
-        if (opt->print_packets) {
+        if (opt->debug) {
             snprintf(label,
                      sizeof(label),
                      "cmd 0x05 chunk offset=0x%04x packet: ",
@@ -811,7 +842,7 @@ static int read_config_template_from_device(const options_t *opt,
                                      false) != 0) {
             return -1;
         }
-        if (opt->print_packets) {
+        if (opt->debug) {
             snprintf(label,
                      sizeof(label),
                      "cmd 0x05 chunk offset=0x%04x response: ",
@@ -1157,6 +1188,19 @@ out:
 }
 
 static void logical_dimensions(const options_t *opt, size_t *width, size_t *height) {
+    if (opt->device_layout == DEVICE_LAYOUT_LCD160X96 ||
+        opt->device_layout == DEVICE_LAYOUT_LCD96X160 ||
+        opt->device_layout == DEVICE_LAYOUT_SQUARE128 ||
+        opt->device_layout == DEVICE_LAYOUT_HALF_PORTRAIT) {
+        if (opt->device_layout == DEVICE_LAYOUT_LCD160X96) {
+            *width = DEVICE_LCD_WIDTH;
+            *height = DEVICE_LCD_HEIGHT;
+        } else {
+            *width = device_layout_width(opt->device_layout);
+            *height = device_layout_height(opt->device_layout);
+        }
+        return;
+    }
     if (opt->orientation == ORIENTATION_PORTRAIT) {
         *width = PORTRAIT_WIDTH;
         *height = PORTRAIT_HEIGHT;
@@ -1226,23 +1270,214 @@ static void encode_rgb565_payload(const uint8_t *rgba, uint8_t payload[PADDED_IM
     }
 }
 
-static size_t image_packet_count(void) {
-    return (PADDED_IMAGE_SIZE + IMAGE_CHUNK_SIZE - 1) / IMAGE_CHUNK_SIZE;
-}
-
-static size_t payload_packet_count(size_t payload_len) {
-    return (payload_len + IMAGE_CHUNK_SIZE - 1) / IMAGE_CHUNK_SIZE;
-}
-
-static int image_prepare_timeout_ms(const options_t *opt,
-                                    const bucket_upload_plan_t *plan) {
-    size_t total_frames = plan->final_bucket1_frames + plan->final_bucket2_frames;
-    size_t windows_timeout = total_frames * IMAGE_PREPARE_PER_FRAME_TIMEOUT_MS +
-                             IMAGE_PREPARE_BASE_TIMEOUT_MS;
-    if (windows_timeout < (size_t)opt->timeout_ms) {
-        return opt->timeout_ms;
+static void encode_rgb565_strided_payload(const uint8_t *rgba,
+                                          size_t width,
+                                          size_t height,
+                                          size_t row_bytes,
+                                          uint8_t payload[PADDED_IMAGE_SIZE]) {
+    memset(payload, 0, PADDED_IMAGE_SIZE);
+    for (size_t y = 0; y < height; y++) {
+        uint8_t *row = payload + y * row_bytes;
+        for (size_t x = 0; x < width; x++) {
+            size_t i = y * width + x;
+            uint8_t red = rgba[i * 4 + 0];
+            uint8_t green = rgba[i * 4 + 1];
+            uint8_t blue = rgba[i * 4 + 2];
+            uint16_t rgb565 = (uint16_t)(((red >> 3) << 11) |
+                                         ((green >> 2) << 5) |
+                                         (blue >> 3));
+            row[x * 2 + 0] = (uint8_t)(rgb565 >> 8);
+            row[x * 2 + 1] = (uint8_t)(rgb565 & 0xff);
+        }
     }
+}
+
+static size_t device_layout_width(device_layout_t layout) {
+    if (layout == DEVICE_LAYOUT_LCD160X96) {
+        return DEVICE_LCD_MEMORY_WIDTH;
+    }
+    if (layout == DEVICE_LAYOUT_LCD96X160) {
+        return DEVICE_LCD_WIDTH;
+    }
+    if (layout == DEVICE_LAYOUT_SQUARE128) {
+        return DEVICE_SQUARE_WIDTH;
+    }
+    if (layout == DEVICE_LAYOUT_HALF_PORTRAIT) {
+        return DEVICE_HALF_WIDTH;
+    }
+    return FRAMEBUFFER_WIDTH;
+}
+
+static size_t device_layout_height(device_layout_t layout) {
+    if (layout == DEVICE_LAYOUT_LCD160X96) {
+        return DEVICE_LCD_MEMORY_HEIGHT;
+    }
+    if (layout == DEVICE_LAYOUT_LCD96X160) {
+        return DEVICE_LCD_HEIGHT;
+    }
+    if (layout == DEVICE_LAYOUT_SQUARE128) {
+        return DEVICE_SQUARE_HEIGHT;
+    }
+    if (layout == DEVICE_LAYOUT_HALF_PORTRAIT) {
+        return DEVICE_HALF_HEIGHT;
+    }
+    return FRAMEBUFFER_HEIGHT;
+}
+
+static void logical_to_scaled_rgba(const uint8_t *logical,
+                                   size_t logical_w,
+                                   size_t logical_h,
+                                   size_t device_w,
+                                   size_t device_h,
+                                   uint8_t *device_rgba) {
+    for (size_t y = 0; y < device_h; y++) {
+        size_t sy = (y * logical_h) / device_h;
+        if (sy >= logical_h) {
+            sy = logical_h - 1;
+        }
+        for (size_t x = 0; x < device_w; x++) {
+            size_t sx = (x * logical_w) / device_w;
+            if (sx >= logical_w) {
+                sx = logical_w - 1;
+            }
+            memcpy(device_rgba + ((y * device_w + x) * 4),
+                   logical + ((sy * logical_w + sx) * 4),
+                   4);
+        }
+    }
+}
+
+static int logical_to_lcd160x96_rgba(const uint8_t *logical,
+                                     size_t logical_w,
+                                     size_t logical_h,
+                                     uint8_t *device_rgba) {
+    if (logical_w != DEVICE_LCD_WIDTH || logical_h != DEVICE_LCD_HEIGHT) {
+        fprintf(stderr,
+                "lcd160x96 layout requires a %dx%d physical source, got %zux%zu\n",
+                DEVICE_LCD_WIDTH,
+                DEVICE_LCD_HEIGHT,
+                logical_w,
+                logical_h);
+        return -1;
+    }
+
+    for (size_t y = 0; y < DEVICE_LCD_MEMORY_HEIGHT; y++) {
+        for (size_t x = 0; x < DEVICE_LCD_MEMORY_WIDTH; x++) {
+            size_t sx = DEVICE_LCD_WIDTH - 1 - y;
+            size_t sy = x;
+            memcpy(device_rgba + ((y * DEVICE_LCD_MEMORY_WIDTH + x) * 4),
+                   logical + ((sy * DEVICE_LCD_WIDTH + sx) * 4),
+                   4);
+        }
+    }
+    return 0;
+}
+
+static int encode_logical_frame_payload(const options_t *opt,
+                                        const uint8_t *logical_rgba,
+                                        size_t logical_w,
+                                        size_t logical_h,
+                                        const char *device_preview_file,
+                                        uint8_t payload[PADDED_IMAGE_SIZE]) {
+    if (opt->device_layout == DEVICE_LAYOUT_LCD160X96 ||
+        opt->device_layout == DEVICE_LAYOUT_LCD96X160 ||
+        opt->device_layout == DEVICE_LAYOUT_SQUARE128 ||
+        opt->device_layout == DEVICE_LAYOUT_HALF_PORTRAIT) {
+        size_t device_w = device_layout_width(opt->device_layout);
+        size_t device_h = device_layout_height(opt->device_layout);
+        uint8_t *device_rgba = malloc(device_w * device_h * 4);
+        if (device_rgba == NULL) {
+            fprintf(stderr, "out of memory\n");
+            return -1;
+        }
+        if (opt->device_layout == DEVICE_LAYOUT_LCD160X96) {
+            if (logical_to_lcd160x96_rgba(logical_rgba,
+                                          logical_w,
+                                          logical_h,
+                                          device_rgba) != 0) {
+                free(device_rgba);
+                return -1;
+            }
+        } else {
+            logical_to_scaled_rgba(logical_rgba,
+                                   logical_w,
+                                   logical_h,
+                                   device_w,
+                                   device_h,
+                                   device_rgba);
+        }
+        encode_rgb565_strided_payload(device_rgba,
+                                      device_w,
+                                      device_h,
+                                      (size_t)opt->device_row_bytes,
+                                      payload);
+        if (device_preview_file != NULL &&
+            write_preview_png(device_preview_file,
+                              device_rgba,
+                              device_w,
+                              device_h) != 0) {
+            free(device_rgba);
+            return -1;
+        }
+        free(device_rgba);
+        return 0;
+    }
+
+    uint8_t *framebuffer_rgba = malloc(IMAGE_PIXELS * 4);
+    if (framebuffer_rgba == NULL) {
+        fprintf(stderr, "out of memory\n");
+        return -1;
+    }
+    if (rotate_logical_to_framebuffer(logical_rgba,
+                                      logical_w,
+                                      logical_h,
+                                      opt->rotate_degrees,
+                                      framebuffer_rgba) != 0) {
+        free(framebuffer_rgba);
+        return -1;
+    }
+    encode_rgb565_payload(framebuffer_rgba, payload);
+    if (device_preview_file != NULL &&
+        write_preview_png(device_preview_file,
+                          framebuffer_rgba,
+                          FRAMEBUFFER_WIDTH,
+                          FRAMEBUFFER_HEIGHT) != 0) {
+        free(framebuffer_rgba);
+        return -1;
+    }
+    free(framebuffer_rgba);
+    return 0;
+}
+
+static size_t image_packet_count(const options_t *opt) {
+    size_t chunk_size = (size_t)opt->image_chunk_size;
+    return (PADDED_IMAGE_SIZE + chunk_size - 1) / chunk_size;
+}
+
+static size_t payload_packet_count(const options_t *opt, size_t payload_len) {
+    size_t chunk_size = (size_t)opt->image_chunk_size;
+    return (payload_len + chunk_size - 1) / chunk_size;
+}
+
+static size_t device_frame_bytes(const options_t *opt) {
+    return (size_t)opt->device_frame_bytes;
+}
+
+static size_t image_prepare_frame_count(const bucket_upload_plan_t *plan) {
+    size_t existing_total = plan->existing_bucket1_frames + plan->existing_bucket2_frames;
+    size_t final_total = plan->final_bucket1_frames + plan->final_bucket2_frames;
+    return existing_total > final_total ? existing_total : final_total;
+}
+
+static int image_prepare_windows_timeout_ms(const bucket_upload_plan_t *plan) {
+    size_t prepare_frames = image_prepare_frame_count(plan);
+    size_t windows_timeout = prepare_frames * IMAGE_PREPARE_PER_FRAME_TIMEOUT_MS +
+                             IMAGE_PREPARE_BASE_TIMEOUT_MS;
     return (int)windows_timeout;
+}
+
+static int image_prepare_wait_ms(const options_t *opt) {
+    return opt->timeout_ms > IMAGE_PREPARE_WAIT_MS ? opt->timeout_ms : IMAGE_PREPARE_WAIT_MS;
 }
 
 static void print_image_summary(const uint8_t payload[PADDED_IMAGE_SIZE],
@@ -1253,28 +1488,29 @@ static void print_image_summary(const uint8_t payload[PADDED_IMAGE_SIZE],
     uint8_t first[REPORT_SIZE];
     uint8_t last[REPORT_SIZE];
     uint8_t commit[REPORT_SIZE];
-    size_t packet_count = image_packet_count();
-    size_t last_offset = (packet_count - 1) * IMAGE_CHUNK_SIZE;
+    size_t chunk_size = (size_t)opt->image_chunk_size;
+    size_t packet_count = image_packet_count(opt);
+    size_t last_offset = (packet_count - 1) * chunk_size;
     size_t last_len = PADDED_IMAGE_SIZE - last_offset;
 
-    build_simple_packet(opt->report_id, 0x01, begin);
-    build_image_packet(opt->report_id, payload, IMAGE_CHUNK_SIZE, 0, first);
-    build_image_packet(opt->report_id, payload + last_offset, last_len, (uint32_t)last_offset, last);
-    build_simple_packet(opt->report_id, 0x02, commit);
+    if (opt->debug) {
+        build_simple_packet(opt->report_id, 0x01, begin);
+        build_image_packet(opt->report_id, payload, chunk_size, 0, first);
+        build_image_packet(opt->report_id, payload + last_offset, last_len, (uint32_t)last_offset, last);
+        build_simple_packet(opt->report_id, 0x02, commit);
+        sha256_hex(payload, RGB565_SIZE, raw_hash);
+        sha256_hex(payload, PADDED_IMAGE_SIZE, padded_hash);
+    }
 
-    sha256_hex(payload, RGB565_SIZE, raw_hash);
-    sha256_hex(payload, PADDED_IMAGE_SIZE, padded_hash);
-
-    printf("framebuffer: %dx%d\n", FRAMEBUFFER_WIDTH, FRAMEBUFFER_HEIGHT);
-    printf("rgb565 bytes: %d\n", RGB565_SIZE);
-    printf("padded bytes: %d\n", PADDED_IMAGE_SIZE);
-    printf("chunk bytes: %d\n", IMAGE_CHUNK_SIZE);
+    printf("chunk bytes: %zu\n", chunk_size);
     printf("image packet count: %zu\n", packet_count);
-    printf("rgb565 sha256: %s\n", raw_hash);
-    printf("padded sha256: %s\n", padded_hash);
-    print_hex("first 32 rgb565 bytes: ", payload, 32);
-
-    if (opt->print_packets) {
+    if (opt->debug) {
+        printf("framebuffer: %dx%d\n", FRAMEBUFFER_WIDTH, FRAMEBUFFER_HEIGHT);
+        printf("rgb565 bytes: %d\n", RGB565_SIZE);
+        printf("padded bytes: %d\n", PADDED_IMAGE_SIZE);
+        printf("rgb565 sha256: %s\n", raw_hash);
+        printf("padded sha256: %s\n", padded_hash);
+        print_hex("first 32 rgb565 bytes: ", payload, 32);
         print_hex("cmd 0x01 packet: ", begin, REPORT_SIZE);
         print_hex("first cmd 0x21 packet: ", first, REPORT_SIZE);
         print_hex("last  cmd 0x21 packet: ", last, REPORT_SIZE);
@@ -1328,6 +1564,251 @@ out:
     return source;
 }
 
+static bool has_extension_ci(const char *path, const char *ext) {
+    const char *dot = strrchr(path, '.');
+    if (dot == NULL) {
+        return false;
+    }
+    while (*dot != '\0' && *ext != '\0') {
+        if (tolower((unsigned char)*dot) != tolower((unsigned char)*ext)) {
+            return false;
+        }
+        dot++;
+        ext++;
+    }
+    return *dot == '\0' && *ext == '\0';
+}
+
+static const char *magick_command(void) {
+    if (access("/opt/homebrew/bin/magick", X_OK) == 0) {
+        return "/opt/homebrew/bin/magick";
+    }
+    if (access("/usr/local/bin/magick", X_OK) == 0) {
+        return "/usr/local/bin/magick";
+    }
+    return "magick";
+}
+
+static int run_magick_coalesce(const char *input_path, const char *output_pattern) {
+    const char *magick = magick_command();
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return -1;
+    }
+    if (pid == 0) {
+        execlp(magick, magick, input_path, "-coalesce", output_pattern, (char *)NULL);
+        _exit(127);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        perror("waitpid");
+        return -1;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 127) {
+            fprintf(stderr,
+                    "Could not run ImageMagick 'magick'. Install it with: brew install imagemagick\n");
+        } else {
+            fprintf(stderr, "ImageMagick GIF coalesce failed for %s\n", input_path);
+        }
+        return -1;
+    }
+    return 0;
+}
+
+static int png_frame_filter(const struct dirent *entry) {
+    return strncmp(entry->d_name, "frame-", 6) == 0 &&
+           has_extension_ci(entry->d_name, ".png");
+}
+
+static int list_coalesced_frames(const char *dir,
+                                 int max_frames,
+                                 char ***out_paths,
+                                 size_t *out_count) {
+    struct dirent **entries = NULL;
+    int n = scandir(dir, &entries, png_frame_filter, alphasort);
+    if (n < 0) {
+        perror(dir);
+        return -1;
+    }
+    if (n == 0) {
+        fprintf(stderr, "ImageMagick did not produce any coalesced PNG frames\n");
+        free(entries);
+        return -1;
+    }
+    if (n > max_frames) {
+        fprintf(stderr,
+                "GIF has %d coalesced frames, above --max-frames-per-bucket %d\n",
+                n,
+                max_frames);
+        for (int i = 0; i < n; i++) {
+            free(entries[i]);
+        }
+        free(entries);
+        return -1;
+    }
+
+    char **paths = calloc((size_t)n, sizeof(*paths));
+    if (paths == NULL) {
+        fprintf(stderr, "out of memory\n");
+        for (int i = 0; i < n; i++) {
+            free(entries[i]);
+        }
+        free(entries);
+        return -1;
+    }
+
+    for (int i = 0; i < n; i++) {
+        size_t len = strlen(dir) + 1 + strlen(entries[i]->d_name) + 1;
+        paths[i] = malloc(len);
+        if (paths[i] == NULL) {
+            fprintf(stderr, "out of memory\n");
+            for (int j = 0; j < i; j++) {
+                free(paths[j]);
+            }
+            free(paths);
+            for (int j = 0; j < n; j++) {
+                free(entries[j]);
+            }
+            free(entries);
+            return -1;
+        }
+        snprintf(paths[i], len, "%s/%s", dir, entries[i]->d_name);
+    }
+
+    for (int i = 0; i < n; i++) {
+        free(entries[i]);
+    }
+    free(entries);
+
+    *out_paths = paths;
+    *out_count = (size_t)n;
+    return 0;
+}
+
+static void cleanup_coalesced_frames(const char *dir, char **paths, size_t count) {
+    if (paths != NULL) {
+        for (size_t i = 0; i < count; i++) {
+            if (paths[i] != NULL) {
+                unlink(paths[i]);
+                free(paths[i]);
+            }
+        }
+        free(paths);
+    }
+    if (dir != NULL) {
+        rmdir(dir);
+    }
+}
+
+static int build_bucket_payload_from_frame_files(const options_t *opt,
+                                                 char **frame_paths,
+                                                 size_t frame_count,
+                                                 const char *label,
+                                                 const char *preview_file,
+                                                 const char *framebuffer_preview_file,
+                                                 frame_bucket_t *bucket) {
+    int rc = -1;
+    uint8_t *logical_rgba = NULL;
+    size_t logical_w = 0;
+    size_t logical_h = 0;
+
+    logical_dimensions(opt, &logical_w, &logical_h);
+    bucket->payload = calloc(frame_count, PADDED_IMAGE_SIZE);
+    if (bucket->payload == NULL) {
+        fprintf(stderr, "out of memory\n");
+        goto out;
+    }
+    bucket->frame_count = frame_count;
+
+    for (size_t i = 0; i < frame_count; i++) {
+        free(logical_rgba);
+        logical_rgba = NULL;
+        if (load_image_rgba(frame_paths[i],
+                            opt->fit_mode,
+                            logical_w,
+                            logical_h,
+                            &logical_rgba) != 0) {
+            goto out;
+        }
+        if (i == 0 && preview_file != NULL &&
+            write_preview_png(preview_file, logical_rgba, logical_w, logical_h) != 0) {
+            goto out;
+        }
+        if (encode_logical_frame_payload(opt,
+                                         logical_rgba,
+                                         logical_w,
+                                         logical_h,
+                                         i == 0 ? framebuffer_preview_file : NULL,
+                                         bucket->payload + i * PADDED_IMAGE_SIZE) != 0) {
+            goto out;
+        }
+    }
+
+    if (opt->debug) {
+        printf("%s frames: %zu\n", label, bucket->frame_count);
+        fflush(stdout);
+    }
+    rc = 0;
+
+out:
+    if (rc != 0) {
+        free_frame_bucket(bucket);
+    }
+    free(logical_rgba);
+    return rc;
+}
+
+static int build_bucket_payload_from_gif(const options_t *opt,
+                                         const char *path,
+                                         const char *label,
+                                         const char *preview_file,
+                                         const char *framebuffer_preview_file,
+                                         frame_bucket_t *bucket) {
+    int rc = -1;
+    char tmp_template[] = "/private/tmp/cidoo-image-coalesce.XXXXXX";
+    char *tmp_dir = mkdtemp(tmp_template);
+    char output_pattern[PATH_MAX];
+    char **frame_paths = NULL;
+    size_t frame_count = 0;
+
+    if (tmp_dir == NULL) {
+        perror("mkdtemp");
+        return -1;
+    }
+    snprintf(output_pattern,
+             sizeof(output_pattern),
+             "PNG32:%s/frame-%%03d.png",
+             tmp_dir);
+
+    if (opt->debug) {
+        printf("%s GIF: coalescing frames with ImageMagick\n", label);
+        fflush(stdout);
+    }
+    if (run_magick_coalesce(path, output_pattern) != 0) {
+        goto out;
+    }
+    if (list_coalesced_frames(tmp_dir,
+                              opt->max_frames_per_bucket,
+                              &frame_paths,
+                              &frame_count) != 0) {
+        goto out;
+    }
+    rc = build_bucket_payload_from_frame_files(opt,
+                                               frame_paths,
+                                               frame_count,
+                                               label,
+                                               preview_file,
+                                               framebuffer_preview_file,
+                                               bucket);
+
+out:
+    cleanup_coalesced_frames(tmp_dir, frame_paths, frame_count);
+    return rc;
+}
+
 static int build_bucket_payload(const options_t *opt,
                                 const char *path,
                                 const char *label,
@@ -1337,12 +1818,20 @@ static int build_bucket_payload(const options_t *opt,
     int rc = -1;
     CGImageSourceRef source = NULL;
     uint8_t *logical_rgba = NULL;
-    uint8_t *framebuffer_rgba = NULL;
     size_t logical_w = 0;
     size_t logical_h = 0;
 
     memset(bucket, 0, sizeof(*bucket));
     logical_dimensions(opt, &logical_w, &logical_h);
+
+    if (has_extension_ci(path, ".gif")) {
+        return build_bucket_payload_from_gif(opt,
+                                             path,
+                                             label,
+                                             preview_file,
+                                             framebuffer_preview_file,
+                                             bucket);
+    }
 
     source = create_image_source_for_path(path);
     if (source == NULL) {
@@ -1370,12 +1859,6 @@ static int build_bucket_payload(const options_t *opt,
     }
     bucket->frame_count = frame_count;
 
-    framebuffer_rgba = malloc(IMAGE_PIXELS * 4);
-    if (framebuffer_rgba == NULL) {
-        fprintf(stderr, "out of memory\n");
-        goto out;
-    }
-
     for (size_t i = 0; i < frame_count; i++) {
         free(logical_rgba);
         logical_rgba = NULL;
@@ -1388,37 +1871,30 @@ static int build_bucket_payload(const options_t *opt,
                                   &logical_rgba) != 0) {
             goto out;
         }
-        if (rotate_logical_to_framebuffer(logical_rgba,
-                                          logical_w,
-                                          logical_h,
-                                          opt->rotate_degrees,
-                                          framebuffer_rgba) != 0) {
-            goto out;
-        }
-        encode_rgb565_payload(framebuffer_rgba, bucket->payload + i * PADDED_IMAGE_SIZE);
-
         if (i == 0 && preview_file != NULL &&
             write_preview_png(preview_file, logical_rgba, logical_w, logical_h) != 0) {
             goto out;
         }
-        if (i == 0 && framebuffer_preview_file != NULL &&
-            write_preview_png(framebuffer_preview_file,
-                              framebuffer_rgba,
-                              FRAMEBUFFER_WIDTH,
-                              FRAMEBUFFER_HEIGHT) != 0) {
+        if (encode_logical_frame_payload(opt,
+                                         logical_rgba,
+                                         logical_w,
+                                         logical_h,
+                                         i == 0 ? framebuffer_preview_file : NULL,
+                                         bucket->payload + i * PADDED_IMAGE_SIZE) != 0) {
             goto out;
         }
     }
 
-    printf("%s frames: %zu\n", label, bucket->frame_count);
-    fflush(stdout);
+    if (opt->debug) {
+        printf("%s frames: %zu\n", label, bucket->frame_count);
+        fflush(stdout);
+    }
     rc = 0;
 
 out:
     if (rc != 0) {
         free_frame_bucket(bucket);
     }
-    free(framebuffer_rgba);
     free(logical_rgba);
     if (source != NULL) {
         CFRelease(source);
@@ -1473,6 +1949,7 @@ static int finalize_bucket_upload_plan(const options_t *opt,
     uint8_t *payload = NULL;
     size_t total_frames = 0;
     size_t payload_frames = 0;
+    size_t out_frame_bytes = device_frame_bytes(opt);
 
     plan->existing_bucket1_frames = template_record[BUCKET1_COUNT_OFFSET];
     plan->existing_bucket2_frames = template_record[BUCKET2_COUNT_OFFSET];
@@ -1513,7 +1990,7 @@ static int finalize_bucket_upload_plan(const options_t *opt,
         plan->payload_offset = 0;
         payload_frames = plan->bucket1.frame_count;
     } else {
-        size_t offset = plan->final_bucket1_frames * PADDED_IMAGE_SIZE;
+        size_t offset = plan->final_bucket1_frames * out_frame_bytes;
         if (offset > 0x00ffffffu) {
             fprintf(stderr, "Refusing GIF2 offset 0x%zx: exceeds 24-bit packet offset\n", offset);
             return -1;
@@ -1522,30 +1999,41 @@ static int finalize_bucket_upload_plan(const options_t *opt,
         payload_frames = plan->bucket2.frame_count;
     }
 
-    plan->payload_len = payload_frames * PADDED_IMAGE_SIZE;
+    plan->payload_len = payload_frames * out_frame_bytes;
     payload = malloc(plan->payload_len);
     if (payload == NULL) {
         fprintf(stderr, "out of memory\n");
         return -1;
     }
     if (plan->write_bucket1 && plan->write_bucket2) {
-        memcpy(payload, plan->bucket1.payload, plan->bucket1.frame_count * PADDED_IMAGE_SIZE);
-        memcpy(payload + plan->bucket1.frame_count * PADDED_IMAGE_SIZE,
-               plan->bucket2.payload,
-               plan->bucket2.frame_count * PADDED_IMAGE_SIZE);
+        for (size_t i = 0; i < plan->bucket1.frame_count; i++) {
+            memcpy(payload + i * out_frame_bytes,
+                   plan->bucket1.payload + i * PADDED_IMAGE_SIZE,
+                   out_frame_bytes);
+        }
+        size_t bucket2_out_offset = plan->bucket1.frame_count * out_frame_bytes;
+        for (size_t i = 0; i < plan->bucket2.frame_count; i++) {
+            memcpy(payload + bucket2_out_offset + i * out_frame_bytes,
+                   plan->bucket2.payload + i * PADDED_IMAGE_SIZE,
+                   out_frame_bytes);
+        }
     } else if (plan->write_bucket1) {
-        memcpy(payload, plan->bucket1.payload, plan->bucket1.frame_count * PADDED_IMAGE_SIZE);
+        for (size_t i = 0; i < plan->bucket1.frame_count; i++) {
+            memcpy(payload + i * out_frame_bytes,
+                   plan->bucket1.payload + i * PADDED_IMAGE_SIZE,
+                   out_frame_bytes);
+        }
     } else {
-        memcpy(payload, plan->bucket2.payload, plan->bucket2.frame_count * PADDED_IMAGE_SIZE);
+        for (size_t i = 0; i < plan->bucket2.frame_count; i++) {
+            memcpy(payload + i * out_frame_bytes,
+                   plan->bucket2.payload + i * PADDED_IMAGE_SIZE,
+                   out_frame_bytes);
+        }
     }
 
-    if (opt->active_bucket_set) {
-        plan->final_active_bucket = opt->active_bucket;
-    } else if (plan->write_bucket2 && !plan->write_bucket1) {
-        plan->final_active_bucket = 2;
-    } else {
-        plan->final_active_bucket = 1;
-    }
+    plan->final_active_selector = opt->active_bucket_set ?
+                                  (uint8_t)opt->active_bucket :
+                                  template_record[ACTIVE_BUCKET_OFFSET];
 
     plan->payload = payload;
     return 0;
@@ -1553,7 +2041,7 @@ static int finalize_bucket_upload_plan(const options_t *opt,
 
 static const char *config_offset_label(size_t offset) {
     if (offset == ACTIVE_BUCKET_OFFSET) {
-        return "active bucket";
+        return "active selector";
     }
     if (offset == BUCKET1_COUNT_OFFSET) {
         return "GIF1 frame count";
@@ -1627,7 +2115,7 @@ static int patch_bucket_config(const options_t *opt,
     }
 
     memcpy(after, before, CONFIG_RECORD_SIZE);
-    after[ACTIVE_BUCKET_OFFSET] = (uint8_t)plan->final_active_bucket;
+    after[ACTIVE_BUCKET_OFFSET] = plan->final_active_selector;
     after[BUCKET1_COUNT_OFFSET] = (uint8_t)plan->final_bucket1_frames;
     after[BUCKET2_COUNT_OFFSET] = (uint8_t)plan->final_bucket2_frames;
     if (!opt->preserve_clock) {
@@ -1652,6 +2140,10 @@ static void print_bucket_config_summary(const options_t *opt,
     char stable_after[65];
     uint8_t packet[REPORT_SIZE];
 
+    if (!opt->debug) {
+        return;
+    }
+
     sha256_hex(before, CONFIG_RECORD_SIZE, hash_before);
     sha256_hex(after, CONFIG_RECORD_SIZE, hash_after);
     stable_config_sha256_hex(before, stable_before);
@@ -1665,15 +2157,13 @@ static void print_bucket_config_summary(const options_t *opt,
     printf("patched  stable sha256: %s\n", stable_after);
     print_config_diff(before, after);
 
-    if (opt->print_packets) {
-        build_config_packet(opt->report_id,
-                            0x06,
-                            after,
-                            CONFIG_RECORD_SIZE,
-                            slot_offset(opt->slot),
-                            packet);
-        print_hex("cmd 0x06 config packet: ", packet, REPORT_SIZE);
-    }
+    build_config_packet(opt->report_id,
+                        0x06,
+                        after,
+                        CONFIG_RECORD_SIZE,
+                        slot_offset(opt->slot),
+                        packet);
+    print_hex("cmd 0x06 config packet: ", packet, REPORT_SIZE);
 }
 
 static void print_bucket_image_summary(const options_t *opt,
@@ -1685,47 +2175,72 @@ static void print_bucket_image_summary(const options_t *opt,
     uint8_t first[REPORT_SIZE];
     uint8_t last[REPORT_SIZE];
     uint8_t image_commit[REPORT_SIZE];
-    size_t packet_count = payload_packet_count(plan->payload_len);
-    size_t last_offset = (packet_count - 1) * IMAGE_CHUNK_SIZE;
+    size_t chunk_size = (size_t)opt->image_chunk_size;
+    size_t packet_count = payload_packet_count(opt, plan->payload_len);
+    size_t last_offset = (packet_count - 1) * chunk_size;
     size_t last_len = plan->payload_len - last_offset;
 
-    build_simple_packet(opt->report_id, 0x01, config_begin);
-    build_simple_packet(opt->report_id, 0x02, config_commit);
-    build_simple_packet(opt->report_id, 0x23, image_prepare);
-    build_image_packet(opt->report_id,
-                       plan->payload,
-                       IMAGE_CHUNK_SIZE,
-                       plan->payload_offset,
-                       first);
-    build_image_packet(opt->report_id,
-                       plan->payload + last_offset,
-                       last_len,
-                       plan->payload_offset + (uint32_t)last_offset,
-                       last);
-    build_simple_packet(opt->report_id, 0x02, image_commit);
-    sha256_hex(plan->payload, plan->payload_len, payload_hash);
+    if (opt->debug) {
+        build_simple_packet(opt->report_id, 0x01, config_begin);
+        build_simple_packet(opt->report_id, 0x02, config_commit);
+        build_simple_packet(opt->report_id, 0x23, image_prepare);
+        build_image_packet(opt->report_id,
+                           plan->payload,
+                           chunk_size,
+                           plan->payload_offset,
+                           first);
+        build_image_packet(opt->report_id,
+                           plan->payload + last_offset,
+                           last_len,
+                           plan->payload_offset + (uint32_t)last_offset,
+                           last);
+        build_simple_packet(opt->report_id, 0x02, image_commit);
+        sha256_hex(plan->payload, plan->payload_len, payload_hash);
+    }
 
-    printf("framebuffer: %dx%d\n", FRAMEBUFFER_WIDTH, FRAMEBUFFER_HEIGHT);
-    printf("rgb565 bytes per frame: %d\n", RGB565_SIZE);
-    printf("padded bytes per frame: %d\n", PADDED_IMAGE_SIZE);
-    printf("chunk bytes: %d\n", IMAGE_CHUNK_SIZE);
-    printf("write GIF1: %s\n", plan->write_bucket1 ? "yes" : "no");
-    printf("write GIF2: %s\n", plan->write_bucket2 ? "yes" : "no");
-    printf("existing GIF1 frame count: %zu\n", plan->existing_bucket1_frames);
-    printf("existing GIF2 frame count: %zu\n", plan->existing_bucket2_frames);
+    printf("device layout: %s\n", device_layout_name(opt->device_layout));
+    if (opt->device_layout == DEVICE_LAYOUT_LCD160X96 ||
+        opt->device_layout == DEVICE_LAYOUT_LCD96X160 ||
+        opt->device_layout == DEVICE_LAYOUT_SQUARE128 ||
+        opt->device_layout == DEVICE_LAYOUT_HALF_PORTRAIT) {
+        size_t device_w = device_layout_width(opt->device_layout);
+        size_t device_h = device_layout_height(opt->device_layout);
+        printf("device logical frame: %zux%zu\n", device_w, device_h);
+        if (opt->debug) {
+            printf("device rgb565 bytes per frame: %zu\n", device_w * device_h * 2);
+            printf("device row bytes: %d\n", opt->device_row_bytes);
+            printf("device row-padded bytes per frame: %zu\n",
+                   (size_t)opt->device_row_bytes * device_h);
+        }
+    }
+    printf("device bytes per frame: %zu\n", device_frame_bytes(opt));
+    printf("chunk bytes: %zu\n", chunk_size);
+    if (opt->debug) {
+        printf("framebuffer: %dx%d\n", FRAMEBUFFER_WIDTH, FRAMEBUFFER_HEIGHT);
+        printf("rgb565 bytes per frame: %d\n", RGB565_SIZE);
+        printf("host padded bytes per frame: %d\n", PADDED_IMAGE_SIZE);
+        printf("write GIF1: %s\n", plan->write_bucket1 ? "yes" : "no");
+        printf("write GIF2: %s\n", plan->write_bucket2 ? "yes" : "no");
+        printf("existing GIF1 frame count: %zu\n", plan->existing_bucket1_frames);
+        printf("existing GIF2 frame count: %zu\n", plan->existing_bucket2_frames);
+    }
     printf("final GIF1 frame count: %zu\n", plan->final_bucket1_frames);
     printf("final GIF2 frame count: %zu\n", plan->final_bucket2_frames);
     printf("final total frame count: %zu\n",
            plan->final_bucket1_frames + plan->final_bucket2_frames);
-    printf("cmd 0x23 image prepare timeout: %d ms\n", image_prepare_timeout_ms(opt, plan));
-    printf("payload start frame: %zu\n", (size_t)plan->payload_offset / PADDED_IMAGE_SIZE);
-    printf("payload start byte offset: %u\n", plan->payload_offset);
     printf("payload bytes sent: %zu\n", plan->payload_len);
     printf("image packet count: %zu\n", packet_count);
-    printf("payload sha256: %s\n", payload_hash);
-    print_hex("first 32 rgb565 bytes: ", plan->payload, 32);
 
-    if (opt->print_packets) {
+    if (opt->debug) {
+        printf("cmd 0x23 image prepare frame basis: %zu\n", image_prepare_frame_count(plan));
+        printf("cmd 0x23 Windows prepare timeout formula: %d ms\n",
+               image_prepare_windows_timeout_ms(plan));
+        printf("cmd 0x23 local prepare wait: %d ms\n", image_prepare_wait_ms(opt));
+        printf("payload start frame: %zu\n",
+               (size_t)plan->payload_offset / device_frame_bytes(opt));
+        printf("payload start byte offset: %u\n", plan->payload_offset);
+        printf("payload sha256: %s\n", payload_hash);
+        print_hex("first 32 rgb565 bytes: ", plan->payload, 32);
         print_hex("cmd 0x01 config begin packet: ", config_begin, REPORT_SIZE);
         print_hex("cmd 0x02 config commit packet: ", config_commit, REPORT_SIZE);
         print_hex("cmd 0x23 image prepare packet: ", image_prepare, REPORT_SIZE);
@@ -1763,17 +2278,55 @@ static int write_bucket_config_to_device(const options_t *opt,
     return 0;
 }
 
+static int verify_bucket_config_readback(const options_t *opt,
+                                         hid_session_t *session,
+                                         const uint8_t expected[CONFIG_RECORD_SIZE]) {
+    uint8_t actual[CONFIG_RECORD_SIZE];
+    char expected_stable[65];
+    char actual_stable[65];
+
+    if (read_config_template_from_device(opt, session, actual) != 0) {
+        fprintf(stderr,
+                "Refusing image stream: could not read back config after metadata write\n");
+        return -1;
+    }
+
+    stable_config_sha256_hex(expected, expected_stable);
+    stable_config_sha256_hex(actual, actual_stable);
+    if (!hex_equals_ci(expected_stable, actual_stable)) {
+        fprintf(stderr,
+                "Refusing image stream: config readback stable sha256 %s does not match "
+                "patched stable sha256 %s\n",
+                actual_stable,
+                expected_stable);
+        print_config_diff(expected, actual);
+        return -1;
+    }
+
+    if (opt->debug) {
+        printf("verified config readback stable sha256: %s\n", actual_stable);
+    } else {
+        printf("verified config readback\n");
+    }
+    return 0;
+}
+
 static int write_bucket_images_to_device(const options_t *opt,
                                          hid_session_t *session,
                                          const bucket_upload_plan_t *plan) {
     uint8_t packet[REPORT_SIZE];
     uint8_t response[REPORT_SIZE];
     size_t response_len = 0;
-    size_t packet_count = payload_packet_count(plan->payload_len);
-    int prepare_timeout_ms = image_prepare_timeout_ms(opt, plan);
+    size_t chunk_size = (size_t)opt->image_chunk_size;
+    size_t packet_count = payload_packet_count(opt, plan->payload_len);
+    int prepare_timeout_ms = image_prepare_wait_ms(opt);
+    int windows_prepare_timeout_ms = image_prepare_windows_timeout_ms(plan);
+    bool prepare_timed_out = false;
 
     build_simple_packet(opt->report_id, 0x23, packet);
-    printf("waiting up to %d ms for cmd 0x23 image prepare\n", prepare_timeout_ms);
+    if (opt->debug) {
+        printf("waiting up to %d ms for cmd 0x23 image prepare\n", prepare_timeout_ms);
+    }
     if (send_report_wait_ignoring_response_error(
             session,
             packet,
@@ -1781,16 +2334,29 @@ static int write_bucket_images_to_device(const options_t *opt,
             prepare_timeout_ms,
             response,
             &response_len,
-            "the Windows all-frame worker does not branch on the cmd 0x23 result") != 0) {
+            opt->debug,
+            &prepare_timed_out) != 0) {
         return -1;
+    }
+    if (prepare_timed_out && windows_prepare_timeout_ms > prepare_timeout_ms) {
+        int settle_ms = windows_prepare_timeout_ms - prepare_timeout_ms;
+        if (opt->debug) {
+            printf("cmd 0x23 did not respond in %d ms; waiting %d ms for device prepare\n",
+                   prepare_timeout_ms,
+                   settle_ms);
+        } else {
+            printf("waiting %d ms for image store prepare\n", settle_ms);
+        }
+        fflush(stdout);
+        sleep_millis(settle_ms);
     }
 
     for (size_t i = 0; i < packet_count; i++) {
-        size_t offset = i * IMAGE_CHUNK_SIZE;
+        size_t offset = i * chunk_size;
         size_t chunk_len = plan->payload_len - offset;
         uint32_t absolute_offset = plan->payload_offset + (uint32_t)offset;
-        if (chunk_len > IMAGE_CHUNK_SIZE) {
-            chunk_len = IMAGE_CHUNK_SIZE;
+        if (chunk_len > chunk_size) {
+            chunk_len = chunk_size;
         }
         build_image_packet(opt->report_id,
                            plan->payload + offset,
@@ -1799,9 +2365,6 @@ static int write_bucket_images_to_device(const options_t *opt,
                            packet);
         if (send_report_wait(session, packet, 0x21, opt->timeout_ms, response, &response_len) != 0) {
             return -1;
-        }
-        if (offset == 0) {
-            sleep_millis(500);
         }
         if ((i + 1) % 100 == 0 || i + 1 == packet_count) {
             printf("uploaded image packets: %zu/%zu\n", i + 1, packet_count);
@@ -1908,8 +2471,12 @@ static int run_dry_run_buckets(const options_t *opt) {
 
     logical_dimensions(opt, &logical_w, &logical_h);
     printf("physical preview: %zux%zu\n", logical_w, logical_h);
-    printf("rotation into framebuffer: %d\n", opt->rotate_degrees);
-    printf("active bucket after upload: %d\n", plan.final_active_bucket);
+    if (opt->device_layout == DEVICE_LAYOUT_FRAMEBUFFER) {
+        printf("rotation into framebuffer: %d\n", opt->rotate_degrees);
+    } else {
+        printf("rotation into framebuffer: not used\n");
+    }
+    printf("active selector byte after upload: %u\n", plan.final_active_selector);
     printf("clock bytes: %s\n", opt->preserve_clock ? "preserved" : "refreshed to local time");
     print_bucket_config_summary(opt, template_record, patched);
     print_bucket_image_summary(opt, &plan);
@@ -1935,15 +2502,6 @@ static int run_upload(const options_t *opt) {
 
     if (opt->image_file == NULL) {
         fprintf(stderr, "upload needs --image PATH\n");
-        return 2;
-    }
-    if (!opt->allow_image_write) {
-        fprintf(stderr, "Refusing upload without --allow-image-write\n");
-        return 2;
-    }
-    if (opt->confirm_upload == NULL ||
-        strcmp(opt->confirm_upload, UPLOAD_CONFIRM_TEXT) != 0) {
-        fprintf(stderr, "Refusing upload without --confirm-upload " UPLOAD_CONFIRM_TEXT "\n");
         return 2;
     }
 #if !IMAGE_UPLOAD_METADATA_IMPLEMENTED
@@ -2000,12 +2558,13 @@ static int run_upload(const options_t *opt) {
         goto out_hid;
     }
 
-    size_t packet_count = image_packet_count();
+    size_t chunk_size = (size_t)opt->image_chunk_size;
+    size_t packet_count = image_packet_count(opt);
     for (size_t i = 0; i < packet_count; i++) {
-        size_t offset = i * IMAGE_CHUNK_SIZE;
+        size_t offset = i * chunk_size;
         size_t chunk_len = PADDED_IMAGE_SIZE - offset;
-        if (chunk_len > IMAGE_CHUNK_SIZE) {
-            chunk_len = IMAGE_CHUNK_SIZE;
+        if (chunk_len > chunk_size) {
+            chunk_len = chunk_size;
         }
         build_image_packet(opt->report_id,
                            payload + offset,
@@ -2014,9 +2573,6 @@ static int run_upload(const options_t *opt) {
                            packet);
         if (send_report_wait(&session, packet, 0x21, opt->timeout_ms, response, &response_len) != 0) {
             goto out_hid;
-        }
-        if (offset == 0) {
-            sleep_millis(500);
         }
         if ((i + 1) % 100 == 0 || i + 1 == packet_count) {
             printf("uploaded image packets: %zu/%zu\n", i + 1, packet_count);
@@ -2061,28 +2617,6 @@ static int run_upload_buckets(const options_t *opt) {
                 "combined custom-image store. Provide both --bucket1 and --bucket2.\n");
         return 2;
     }
-    if (!opt->allow_hid_query) {
-        fprintf(stderr, "Refusing upload without --allow-hid-query\n");
-        return 2;
-    }
-    if (!opt->allow_config_write) {
-        fprintf(stderr, "Refusing upload without --allow-config-write\n");
-        return 2;
-    }
-    if (!opt->allow_image_write) {
-        fprintf(stderr, "Refusing upload without --allow-image-write\n");
-        return 2;
-    }
-    if (opt->confirm_upload == NULL ||
-        strcmp(opt->confirm_upload, UPLOAD_CONFIRM_TEXT) != 0) {
-        fprintf(stderr, "Refusing upload without --confirm-upload " UPLOAD_CONFIRM_TEXT "\n");
-        return 2;
-    }
-    if (opt->expected_stable_sha256 == NULL) {
-        fprintf(stderr, "Refusing upload without --expected-stable-sha256 from dry-run/read-template\n");
-        return 2;
-    }
-
     if (build_requested_bucket_payloads(opt, &plan) != 0) {
         return 1;
     }
@@ -2096,7 +2630,11 @@ static int run_upload_buckets(const options_t *opt) {
         goto out;
     }
     stable_config_sha256_hex(current, stable_hash_current);
-    if (!hex_equals_ci(stable_hash_current, opt->expected_stable_sha256)) {
+    if (opt->debug) {
+        printf("current template stable sha256: %s\n", stable_hash_current);
+    }
+    if (opt->expected_stable_sha256 != NULL &&
+        !hex_equals_ci(stable_hash_current, opt->expected_stable_sha256)) {
         fprintf(stderr,
                 "Refusing upload: stable template sha256 %s does not match expected %s\n",
                 stable_hash_current,
@@ -2110,12 +2648,15 @@ static int run_upload_buckets(const options_t *opt) {
         goto out;
     }
 
-    printf("active bucket after upload: %d\n", plan.final_active_bucket);
+    printf("active selector byte after upload: %u\n", plan.final_active_selector);
     printf("clock bytes: %s\n", opt->preserve_clock ? "preserved" : "refreshed to local time");
     print_bucket_config_summary(opt, current, patched);
     print_bucket_image_summary(opt, &plan);
 
     if (write_bucket_config_to_device(opt, &session, patched) != 0) {
+        goto out;
+    }
+    if (verify_bucket_config_readback(opt, &session, patched) != 0) {
         goto out;
     }
     if (write_bucket_images_to_device(opt, &session, &plan) != 0) {
@@ -2178,6 +2719,46 @@ static orientation_t parse_orientation(const char *s) {
     exit(2);
 }
 
+static device_layout_t parse_device_layout(const char *s) {
+    if (strcmp(s, "lcd160x96") == 0 ||
+        strcmp(s, "screen160x96") == 0 ||
+        strcmp(s, "160x96") == 0) {
+        return DEVICE_LAYOUT_LCD160X96;
+    }
+    if (strcmp(s, "lcd96x160") == 0 ||
+        strcmp(s, "screen96x160") == 0 ||
+        strcmp(s, "96x160") == 0) {
+        return DEVICE_LAYOUT_LCD96X160;
+    }
+    if (strcmp(s, "square128") == 0) {
+        return DEVICE_LAYOUT_SQUARE128;
+    }
+    if (strcmp(s, "half-portrait") == 0) {
+        return DEVICE_LAYOUT_HALF_PORTRAIT;
+    }
+    if (strcmp(s, "framebuffer") == 0) {
+        return DEVICE_LAYOUT_FRAMEBUFFER;
+    }
+    fprintf(stderr, "Invalid --device-layout: %s\n", s);
+    exit(2);
+}
+
+static const char *device_layout_name(device_layout_t layout) {
+    switch (layout) {
+        case DEVICE_LAYOUT_LCD160X96:
+            return "lcd160x96";
+        case DEVICE_LAYOUT_LCD96X160:
+            return "lcd96x160";
+        case DEVICE_LAYOUT_SQUARE128:
+            return "square128";
+        case DEVICE_LAYOUT_HALF_PORTRAIT:
+            return "half-portrait";
+        case DEVICE_LAYOUT_FRAMEBUFFER:
+            return "framebuffer";
+    }
+    return "unknown";
+}
+
 static int parse_rotate(const char *s) {
     int value = parse_int_range(s, "--rotate", 0, 270);
     if (value != 0 && value != 90 && value != 180 && value != 270) {
@@ -2196,11 +2777,15 @@ static void init_options(options_t *opt) {
     opt->usage = DEFAULT_USAGE;
     opt->report_id = DEFAULT_REPORT_ID;
     opt->timeout_ms = 1500;
-    opt->fit_mode = FIT_COVER;
-    opt->orientation = ORIENTATION_LANDSCAPE;
+    opt->fit_mode = FIT_STRETCH;
+    opt->orientation = ORIENTATION_PORTRAIT;
+    opt->device_layout = DEVICE_LAYOUT_LCD160X96;
     opt->rotate_degrees = 0;
     opt->slot = 0;
     opt->active_bucket = 1;
+    opt->image_chunk_size = DEFAULT_IMAGE_CHUNK_SIZE;
+    opt->device_frame_bytes = DEFAULT_DEVICE_FRAME_BYTES;
+    opt->device_row_bytes = DEFAULT_DEVICE_ROW_BYTES;
     opt->max_frames_per_bucket = DEFAULT_MAX_FRAMES_PER_BUCKET;
 }
 
@@ -2218,9 +2803,7 @@ static int parse_options(int argc, char **argv, options_t *opt) {
         {"usage", required_argument, NULL, 1009},
         {"report-id", required_argument, NULL, 1010},
         {"timeout-ms", required_argument, NULL, 1011},
-        {"print-packets", no_argument, NULL, 1012},
-        {"allow-image-write", no_argument, NULL, 1013},
-        {"confirm-upload", required_argument, NULL, 1014},
+        {"debug", no_argument, NULL, 1012},
         {"strip-report-id-for-iohid", no_argument, NULL, 1015},
         {"bucket1", required_argument, NULL, 1016},
         {"bucket2", required_argument, NULL, 1017},
@@ -2229,13 +2812,15 @@ static int parse_options(int argc, char **argv, options_t *opt) {
         {"slot", required_argument, NULL, 1020},
         {"active-bucket", required_argument, NULL, 1021},
         {"max-frames-per-bucket", required_argument, NULL, 1022},
-        {"allow-hid-query", no_argument, NULL, 1023},
-        {"allow-config-write", no_argument, NULL, 1024},
         {"preserve-clock", no_argument, NULL, 1025},
         {"bucket1-preview-out", required_argument, NULL, 1026},
         {"bucket2-preview-out", required_argument, NULL, 1027},
         {"bucket1-framebuffer-preview-out", required_argument, NULL, 1028},
         {"bucket2-framebuffer-preview-out", required_argument, NULL, 1029},
+        {"image-chunk-size", required_argument, NULL, 1030},
+        {"device-frame-bytes", required_argument, NULL, 1031},
+        {"device-layout", required_argument, NULL, 1032},
+        {"device-row-bytes", required_argument, NULL, 1033},
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0},
     };
@@ -2301,13 +2886,7 @@ static int parse_options(int argc, char **argv, options_t *opt) {
                 opt->timeout_ms = parse_int_range(optarg, "--timeout-ms", 100, 30000);
                 break;
             case 1012:
-                opt->print_packets = true;
-                break;
-            case 1013:
-                opt->allow_image_write = true;
-                break;
-            case 1014:
-                opt->confirm_upload = optarg;
+                opt->debug = true;
                 break;
             case 1015:
                 opt->strip_report_id_for_iohid = true;
@@ -2337,12 +2916,6 @@ static int parse_options(int argc, char **argv, options_t *opt) {
                                                               1,
                                                               MAX_HARD_FRAMES_PER_BUCKET);
                 break;
-            case 1023:
-                opt->allow_hid_query = true;
-                break;
-            case 1024:
-                opt->allow_config_write = true;
-                break;
             case 1025:
                 opt->preserve_clock = true;
                 break;
@@ -2358,6 +2931,41 @@ static int parse_options(int argc, char **argv, options_t *opt) {
             case 1029:
                 opt->bucket2_framebuffer_preview_file = optarg;
                 break;
+            case 1030:
+                opt->image_chunk_size = parse_int_range(optarg,
+                                                         "--image-chunk-size",
+                                                         1,
+                                                         MAX_IMAGE_CHUNK_SIZE);
+                if (opt->image_chunk_size != 0x18 && opt->image_chunk_size != 0x38) {
+                    fprintf(stderr,
+                            "Invalid --image-chunk-size: %s; expected 24 or 56\n",
+                            optarg);
+                    return -1;
+                }
+                break;
+            case 1031:
+                opt->device_frame_bytes = parse_int_range(optarg,
+                                                          "--device-frame-bytes",
+                                                          1,
+                                                          PADDED_IMAGE_SIZE);
+                if (opt->device_frame_bytes != 32768 &&
+                    opt->device_frame_bytes != PADDED_IMAGE_SIZE) {
+                    fprintf(stderr,
+                            "Invalid --device-frame-bytes: %s; expected 32768 or 65536\n",
+                            optarg);
+                    return -1;
+                }
+                break;
+            case 1032:
+                opt->device_layout = parse_device_layout(optarg);
+                break;
+            case 1033:
+                opt->device_row_bytes = parse_int_range(optarg,
+                                                        "--device-row-bytes",
+                                                        1,
+                                                        PADDED_IMAGE_SIZE);
+                opt->device_row_bytes_set = true;
+                break;
             default:
                 usage(stderr);
                 return -1;
@@ -2370,7 +2978,7 @@ static int parse_options(int argc, char **argv, options_t *opt) {
     }
 
     if (opt->orientation == ORIENTATION_PORTRAIT && !opt->rotate_set) {
-        opt->rotate_degrees = 90;
+        opt->rotate_degrees = 270;
     }
     if (opt->orientation == ORIENTATION_LANDSCAPE &&
         (opt->rotate_degrees == 90 || opt->rotate_degrees == 270)) {
@@ -2385,6 +2993,39 @@ static int parse_options(int argc, char **argv, options_t *opt) {
     if ((unsigned)opt->slot * CONFIG_SLOT_STRIDE > 0xffffu - (CONFIG_RECORD_SIZE - 1u)) {
         fprintf(stderr, "--slot is too large for the 16-bit config offset\n");
         return -1;
+    }
+    if (opt->device_layout == DEVICE_LAYOUT_LCD160X96 ||
+        opt->device_layout == DEVICE_LAYOUT_LCD96X160 ||
+        opt->device_layout == DEVICE_LAYOUT_SQUARE128 ||
+        opt->device_layout == DEVICE_LAYOUT_HALF_PORTRAIT) {
+        size_t device_w = device_layout_width(opt->device_layout);
+        size_t device_h = device_layout_height(opt->device_layout);
+        size_t row_bytes = (size_t)opt->device_row_bytes;
+        if (!opt->device_row_bytes_set) {
+            row_bytes = device_w * 2;
+            opt->device_row_bytes = (int)row_bytes;
+        }
+        if ((row_bytes % 2) != 0) {
+            fprintf(stderr, "--device-row-bytes must be even for RGB565 rows\n");
+            return -1;
+        }
+        if (row_bytes < device_w * 2) {
+            fprintf(stderr,
+                    "--device-row-bytes %zu is too small for a %zux%zu RGB565 frame\n",
+                    row_bytes,
+                    device_w,
+                    device_h);
+            return -1;
+        }
+        if (row_bytes * device_h > (size_t)opt->device_frame_bytes) {
+            fprintf(stderr,
+                    "--device-row-bytes %zu does not fit %zux%zu into --device-frame-bytes %d\n",
+                    row_bytes,
+                    device_w,
+                    device_h,
+                    opt->device_frame_bytes);
+            return -1;
+        }
     }
 
     return 0;
