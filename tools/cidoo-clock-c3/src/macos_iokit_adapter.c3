@@ -1,4 +1,4 @@
-module cidoo_clock_c3;
+module cdoo;
 
 import std::core::mem;
 import std::io;
@@ -95,7 +95,7 @@ fn int transport_list_devices(Options* opt @unused, bool include_usage) {
 
 fn int transport_open(ClockTransport* transport, Options* opt) {
     *transport = {};
-    MacosIokitTransport* macos = mem::new(MacosIokitTransport);
+    MacosIokitTransport* macos = mem::tnew(MacosIokitTransport);
     *macos = {};
     transport.kind = MACOS_IOKIT;
     transport.impl = macos;
@@ -175,7 +175,8 @@ fn void transport_close(ClockTransport* transport) {
         io_hid_manager_close(macos.manager, K_IOHID_OPTIONS_TYPE_NONE);
         cf_release(macos.manager);
     }
-    mem::free(macos);
+    // Allocated from main's temp pool. This keeps the IOHID callback context
+    // alive through command shutdown, then reclaims it when main exits.
     *transport = {};
 }
 

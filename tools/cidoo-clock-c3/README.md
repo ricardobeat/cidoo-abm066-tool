@@ -5,10 +5,12 @@ in its own project so the existing `.c` files are untouched.
 
 There is no C shim in this port. The transport boundary is C3-only:
 
-- `src/main.c3` owns protocol packets, hashes, time encoding, and update safety
-  checks. It uses the C3 standard library for console output, SHA-256, local
-  time, monotonic timeouts, prompts, memory copies, and the small
-  `ClockTransport { kind, impl }` handle used by the macOS adapter.
+- `src/main.c3` owns command dispatch, shared protocol packets, hashes, and the
+  small `ClockTransport { kind, impl }` handle used by the macOS adapter.
+- `src/clock.c3` owns the clock/config commands, time encoding, config update
+  safety checks, and clock write confirmation prompt.
+- `src/image.c3` owns image decoding, two-bucket metadata patching, and image
+  upload streaming.
 - `lib/cli.c3` owns the small public option surface.
 - `src/macos_iokit_adapter.c3` is the macOS adapter. It contains the
   CoreFoundation/IOKit extern declarations and implements the transport API:

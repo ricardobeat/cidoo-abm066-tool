@@ -1,4 +1,4 @@
-module cidoo_clock_c3;
+module cdoo;
 
 import std::io;
 
