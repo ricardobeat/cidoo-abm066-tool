@@ -8,40 +8,84 @@
     <script type="module" src="./app.mjs"></script>
   </head>
   <body>
-    <main class="shell">
-      <header class="topbar">
-        <div>
+    <main class="app">
+      <section id="menuView" class="menu-view" aria-label="Main menu">
+        <header class="site-head">
           <h1>cdoo</h1>
-          <p id="status" role="status">Loading</p>
-        </div>
-      </header>
+          <p>keyboard tool</p>
+        </header>
 
-      <section class="panel" aria-label="Clock">
-        <button id="updateClock" type="button">Update Clock</button>
+        <nav class="entry-list" aria-label="Tools" role="listbox">
+          <button class="entry" type="button" data-view="clock" style="--i: 0" role="option">
+            <span class="entry-title">clock</span>
+          </button>
+          <button class="entry" type="button" data-view="images" style="--i: 1" role="option">
+            <span class="entry-title">images</span>
+          </button>
+        </nav>
+        <p class="nav-hint">
+          <kbd aria-label="up">
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <path d="M8 13V3M8 3 3.5 7.5M8 3l4.5 4.5"/>
+            </svg>
+          </kbd>
+          <kbd aria-label="down">
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <path d="M8 3v10M8 13l-4.5-4.5M8 13l4.5-4.5"/>
+            </svg>
+          </kbd>
+          to select
+        </p>
       </section>
 
-      <section class="panel upload" aria-label="Images">
-        <div class="image-picker">
-          <p class="image-title">Image 1</p>
-          <label id="image1Box" class="preview-box" for="image1">
-            <span>select image</span>
-            <img id="image1Preview" alt="Image 1 preview" hidden>
-          </label>
-          <input id="image1" class="file-input" type="file" accept=".gif,image/gif">
-          <p id="image1Meta"></p>
+      <section id="clockView" class="work-view" aria-label="Clock" hidden>
+        <header class="site-head">
+          <h1>cdoo</h1>
+          <p>keyboard tool</p>
+        </header>
+        <div class="work-content">
+          <h2>clock</h2>
+          <time id="clockTime" class="clock-time" datetime=""></time>
+          <button id="updateClock" type="button">Update Clock</button>
+          <button id="clockSuccess" class="success-message" type="button" hidden>success</button>
         </div>
-        <div class="image-picker">
-          <p class="image-title">Image 2</p>
-          <label id="image2Box" class="preview-box" for="image2">
-            <span>select image</span>
-            <img id="image2Preview" alt="Image 2 preview" hidden>
-          </label>
-          <input id="image2" class="file-input" type="file" accept=".gif,image/gif">
-          <p id="image2Meta"></p>
-        </div>
-        <button id="uploadImages" type="button">Upload Images</button>
-        <p id="imageStatus" role="status"></p>
+        <button class="back-button" type="button" data-view="menu">back</button>
       </section>
+
+      <section id="imagesView" class="work-view" aria-label="Images" hidden>
+        <header class="site-head">
+          <h1>cdoo</h1>
+          <p>keyboard tool</p>
+        </header>
+        <div class="work-content">
+          <h2>images</h2>
+          <div class="upload">
+            <div class="image-picker">
+              <label id="image1Box" class="preview-box" for="image1">
+                <span>image 1</span>
+                <img id="image1Preview" alt="Image 1 preview" hidden>
+              </label>
+              <input id="image1" class="file-input" type="file" accept=".gif,image/gif">
+              <p id="image1Meta"></p>
+            </div>
+            <div class="image-picker">
+              <label id="image2Box" class="preview-box" for="image2">
+                <span>image 2</span>
+                <img id="image2Preview" alt="Image 2 preview" hidden>
+              </label>
+              <input id="image2" class="file-input" type="file" accept=".gif,image/gif">
+              <p id="image2Meta"></p>
+            </div>
+            <button id="uploadImages" type="button">Upload Images</button>
+            <button id="imagesSuccess" class="success-message" type="button" hidden>success</button>
+            <p id="imageStatus" role="status"></p>
+          </div>
+        </div>
+        <button class="back-button" type="button" data-view="menu">back</button>
+      </section>
+
+      <button id="connectDevice" class="connect-button" type="button">connect</button>
+      <p id="status" class="status-line" role="status"></p>
     </main>
   </body>
 </html>

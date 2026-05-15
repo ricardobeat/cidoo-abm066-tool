@@ -1,8 +1,13 @@
 import { loadCdooCore } from "./cdoo-core-wasm.mjs";
 
 const els = {
+  menuView: document.querySelector("#menuView"),
+  clockView: document.querySelector("#clockView"),
+  imagesView: document.querySelector("#imagesView"),
   status: document.querySelector("#status"),
+  clockTime: document.querySelector("#clockTime"),
   updateClock: document.querySelector("#updateClock"),
+  clockSuccess: document.querySelector("#clockSuccess"),
   image1: document.querySelector("#image1"),
   image2: document.querySelector("#image2"),
   image1Box: document.querySelector("#image1Box"),
@@ -12,12 +17,19 @@ const els = {
   image1Meta: document.querySelector("#image1Meta"),
   image2Meta: document.querySelector("#image2Meta"),
   uploadImages: document.querySelector("#uploadImages"),
+  imagesSuccess: document.querySelector("#imagesSuccess"),
   imageStatus: document.querySelector("#imageStatus"),
+  connectDevice: document.querySelector("#connectDevice"),
+  entries: [...document.querySelectorAll(".entry")],
+  entryList: document.querySelector(".entry-list"),
 };
 
 let core;
 let defaults;
 let device;
+let selectedEntryIndex = location.hash === "#images" ? 1 : 0;
+let lastWheelAt = 0;
+let openTimer = 0;
 const imageSlots = [
   { input: els.image1, box: els.image1Box, preview: els.image1Preview, meta: els.image1Meta, label: "Image 1", previewUrl: null },
   { input: els.image2, box: els.image2Box, preview: els.image2Preview, meta: els.image2Meta, label: "Image 2", previewUrl: null },
@@ -34,18 +46,57 @@ try {
     slot: 0,
     timeoutMs: 1500,
   });
-  setStatus("Ready");
+  setStatus("");
+  showView(location.hash === "#images" ? "images" : location.hash === "#clock" ? "clock" : "menu", false, false);
 } catch (error) {
   setStatus(error.message);
   throw error;
 }
 
 els.updateClock.addEventListener("click", () => {
-  runAction(els.updateClock, updateClock);
+  runAction(els.updateClock, els.clockSuccess, updateClock, setStatus);
 });
 
 els.uploadImages.addEventListener("click", () => {
-  runAction(els.uploadImages, uploadImages, setImageStatus);
+  runAction(els.uploadImages, els.imagesSuccess, uploadImages, setStatus);
+});
+
+els.clockSuccess.addEventListener("click", () => {
+  resetSuccess(els.updateClock, els.clockSuccess);
+});
+
+els.imagesSuccess.addEventListener("click", () => {
+  resetSuccess(els.uploadImages, els.imagesSuccess);
+});
+
+els.connectDevice.addEventListener("click", async () => {
+  els.connectDevice.disabled = true;
+  try {
+    await openDevice();
+    setStatus("ready");
+    updateConnectionUi();
+  } catch (error) {
+    setStatus(error.message);
+    els.connectDevice.hidden = true;
+  }
+});
+
+for (const button of document.querySelectorAll("[data-view]")) {
+  button.addEventListener("click", () => {
+    const entryIndex = els.entries.indexOf(button);
+    if (entryIndex < 0) {
+      showView(button.dataset.view);
+      return;
+    }
+    if (entryIndex >= 0 && entryIndex !== selectedEntryIndex) {
+      setSelectedEntry(entryIndex);
+    }
+    openSelectedEntryDelayed();
+  });
+}
+
+window.addEventListener("hashchange", () => {
+  showView(location.hash === "#images" ? "images" : location.hash === "#clock" ? "clock" : "menu", false);
 });
 
 for (const slot of imageSlots) {
@@ -54,19 +105,123 @@ for (const slot of imageSlots) {
   });
 }
 
+els.entryList.addEventListener("wheel", (event) => {
+  if (els.menuView.hidden) return;
+  event.preventDefault();
+  const now = performance.now();
+  if (now - lastWheelAt < 180 || Math.abs(event.deltaY) < 4) return;
+  lastWheelAt = now;
+  selectRelative(event.deltaY > 0 ? 1 : -1);
+}, { passive: false });
+
+window.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" || event.key === "Backspace") {
+    if (els.menuView.hidden && !isTypingTarget(event.target)) {
+      event.preventDefault();
+      showView("menu");
+    }
+    return;
+  }
+  if (els.menuView.hidden && event.key === "ArrowDown") {
+    event.preventDefault();
+    if (!els.clockView.hidden) {
+      els.updateClock.focus();
+    } else if (!els.imagesView.hidden) {
+      els.uploadImages.focus();
+    }
+    return;
+  }
+  if (els.menuView.hidden) return;
+  if (event.key === "ArrowDown" || event.key === "ArrowRight") {
+    event.preventDefault();
+    selectRelative(-1);
+  } else if (event.key === "ArrowUp" || event.key === "ArrowLeft") {
+    event.preventDefault();
+    selectRelative(1);
+  } else if (event.key === "Enter") {
+    event.preventDefault();
+    showView(els.entries[selectedEntryIndex].dataset.view);
+  }
+});
+
+function isTypingTarget(target) {
+  return target instanceof HTMLInputElement ||
+    target instanceof HTMLTextAreaElement ||
+    target instanceof HTMLSelectElement ||
+    target?.isContentEditable;
+}
+
+setSelectedEntry(selectedEntryIndex);
+updateClockTime();
+window.setInterval(updateClockTime, 1000);
+
+function selectRelative(delta) {
+  setSelectedEntry((selectedEntryIndex + delta + els.entries.length) % els.entries.length);
+}
+
+function setSelectedEntry(index) {
+  window.clearTimeout(openTimer);
+  selectedEntryIndex = index;
+  els.entryList.style.setProperty("--selected", String(index));
+  for (let i = 0; i < els.entries.length; i++) {
+    const selected = i === index;
+    els.entries[i].classList.toggle("is-selected", selected);
+    els.entries[i].setAttribute("aria-selected", selected ? "true" : "false");
+    els.entries[i].tabIndex = selected ? 0 : -1;
+  }
+}
+
+function openSelectedEntryDelayed() {
+  window.clearTimeout(openTimer);
+  const view = els.entries[selectedEntryIndex].dataset.view;
+  openTimer = window.setTimeout(() => {
+    showView(view);
+  }, 1500);
+}
+
+function showView(name, updateHash = true, animate = true) {
+  window.clearTimeout(openTimer);
+  const selected = name === "clock" || name === "images" ? name : "menu";
+  const apply = () => {
+    els.menuView.hidden = selected !== "menu";
+    els.clockView.hidden = selected !== "clock";
+    els.imagesView.hidden = selected !== "images";
+
+    if (updateHash) {
+      const nextHash = selected === "menu" ? "" : `#${selected}`;
+      if (location.hash !== nextHash) {
+        history.pushState(null, "", `${location.pathname}${location.search}${nextHash}`);
+      }
+    }
+  };
+
+  if (animate && document.startViewTransition) {
+    document.startViewTransition(apply);
+  } else {
+    apply();
+  }
+}
+
 async function updateClock() {
-  setStatus("Connecting");
+  setStatus("clock: connecting");
+  await progressDelay();
   await openDevice();
 
-  setStatus("Reading clock config");
+  setStatus("clock: reading config");
+  await progressDelay();
   const current = await readTemplate();
+  setStatus("clock: encoding local time");
+  await progressDelay();
   const timeBytes = core.writeTimeBytes(new Date());
   const patched = core.patchTime(current, timeBytes);
+  setStatus("clock: verifying patch");
+  await progressDelay();
   verifyOnlyTimeChanged(current, patched);
 
-  setStatus("Writing clock");
+  setStatus("clock: writing config");
+  await progressDelay();
   await writeConfig(patched);
-  setStatus("Clock updated");
+  setStatus("clock: done");
 }
 
 async function uploadImages() {
@@ -78,7 +233,7 @@ async function uploadImages() {
   validateGifFile(file1);
   validateGifFile(file2);
 
-  setImageStatus("Decoding GIFs");
+  setStatus("images: decoding GIFs");
   const gif1 = await decodeGifFrames(file1, imageSlots[0]);
   const gif2 = await decodeGifFrames(file2, imageSlots[1]);
   const totalFrames = gif1.frames.length + gif2.frames.length;
@@ -90,21 +245,22 @@ async function uploadImages() {
   }
   const payload = concatFrames(gif1.frames, gif2.frames);
 
-  setImageStatus("Connecting");
+  setStatus("images: connecting");
   await openDevice();
 
-  setImageStatus("Reading clock config");
+  setStatus("images: reading config");
   const current = await readTemplate();
   const existingBucket1Frames = current[34];
   const existingBucket2Frames = current[46];
   const activeSelector = current[33];
+  setStatus("images: patching metadata");
   const patched = core.patchImageConfig(current, activeSelector, gif1.frames.length, gif2.frames.length);
   verifyOnlyImageMetadataChanged(current, patched);
 
-  setImageStatus("Writing image config");
+  setStatus("images: writing config");
   await writeConfig(patched);
 
-  setImageStatus("Verifying image config");
+  setStatus("images: verifying config");
   const readback = await readTemplate();
   if (!recordsEqualIgnoringTime(readback, patched)) {
     throw new Error("Image config readback did not match.");
@@ -117,7 +273,7 @@ async function uploadImages() {
     gif1.frames.length,
     gif2.frames.length,
   );
-  setImageStatus("Images uploaded");
+  setStatus("images: done");
 }
 
 async function decodeGifFrames(file, slot) {
@@ -143,7 +299,7 @@ async function decodeGifFrames(file, slot) {
 
     const frames = [];
     for (let i = 0; i < frameCount; i++) {
-      setImageStatus(`${slot.label}: decoding ${i + 1}/${frameCount}`);
+      setStatus(`${slot.label}: decoding ${i + 1}/${frameCount}`);
       const { image } = await decoder.decode({ frameIndex: i, completeFramesOnly: true });
       try {
         frames.push(encodeDecodedFrame(image));
@@ -208,6 +364,7 @@ async function openDevice() {
   if (!device.opened) {
     await device.open();
   }
+  updateConnectionUi();
   return device;
 }
 
@@ -262,7 +419,7 @@ async function writeImagePayload(payload, existingBucket1Frames, existingBucket2
   );
   const packetCount = core.payloadPacketCount(payload.length);
 
-  setImageStatus("Preparing display");
+  setStatus("images: preparing display");
   await sendPacketWait(core.buildSimplePacket(defaults.reportId, 0x23), 0x23, {
     allowTimeout: true,
     checkStatus: false,
@@ -280,7 +437,7 @@ async function writeImagePayload(payload, existingBucket1Frames, existingBucket2
     );
     await sendPacketWait(packet, 0x21);
     if ((i + 1) % 100 === 0 || i + 1 === packetCount) {
-      setImageStatus(`Uploading images ${i + 1}/${packetCount}`);
+      setStatus(`images: uploading ${i + 1}/${packetCount}`);
     }
   }
 
@@ -398,7 +555,7 @@ function handleImageSelection(slot) {
   } catch (error) {
     slot.input.value = "";
     slot.meta.textContent = error.message;
-    setImageStatus(error.message);
+    setStatus(error.message);
   }
 }
 
@@ -424,34 +581,75 @@ function formatFrameCount(count) {
   return count === 1 ? "1 frame" : `${count} frames`;
 }
 
-async function runAction(button, action, report = setStatus) {
+async function runAction(button, successMessage, action, report = setStatus) {
+  const originalLabel = button.textContent;
   setBusy(true);
   button.setAttribute("aria-busy", "true");
+  if (button === els.uploadImages) button.textContent = "uploading...";
   try {
     await action();
+    showSuccess(button, successMessage);
   } catch (error) {
     report(error.message);
+    button.textContent = originalLabel;
   } finally {
     button.removeAttribute("aria-busy");
-    setBusy(false);
+    setBusy(false, button);
   }
 }
 
-function setBusy(value) {
-  els.updateClock.disabled = value;
-  els.uploadImages.disabled = value;
+function showSuccess(button, successMessage) {
+  button.hidden = true;
+  button.disabled = true;
+  successMessage.hidden = false;
+  successMessage.focus();
+}
+
+function resetSuccess(button, successMessage) {
+  successMessage.hidden = true;
+  button.hidden = false;
+  button.disabled = false;
+  if (button === els.uploadImages) button.textContent = "Upload Images";
+  button.focus();
+}
+
+function setBusy(value, except = null) {
+  if (els.updateClock !== except) els.updateClock.disabled = value;
+  if (els.uploadImages !== except) els.uploadImages.disabled = value;
   els.image1.disabled = value;
   els.image2.disabled = value;
 }
 
 function setStatus(message) {
   els.status.textContent = message;
+  els.status.hidden = !message;
+  els.connectDevice.hidden = !!message || !!device?.opened;
 }
 
-function setImageStatus(message) {
-  els.imageStatus.textContent = message;
+function updateConnectionUi() {
+  const connected = !!device?.opened;
+  els.connectDevice.hidden = connected;
+  els.status.hidden = !connected || !els.status.textContent;
+}
+
+function updateClockTime() {
+  const value = formatToolDateTime(new Date());
+  els.clockTime.textContent = value;
+  els.clockTime.dateTime = value;
+}
+
+function formatToolDateTime(date) {
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}T${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`;
+}
+
+function pad2(value) {
+  return String(value).padStart(2, "0");
 }
 
 function sleep(ms) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function progressDelay() {
+  return sleep(350);
 }
